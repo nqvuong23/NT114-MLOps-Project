@@ -51,3 +51,14 @@ module "computing" {
   depends_on = [module.networking]
 }
 
+# ------- Module: Kafka (Serverless MSK) -------
+module "kafka" {
+  source = "./modules/kafka"
+
+  project_name      = var.project_name
+  vpc_id            = module.networking.vpc_id
+  public_subnet_ids = module.networking.public_subnet_ids
+  tags              = local.common_tags
+
+  depends_on = [module.networking]
+}
