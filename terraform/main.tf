@@ -62,3 +62,15 @@ module "kafka" {
 
   depends_on = [module.networking]
 }
+
+# ------- Module: EMR Serverless -------
+module "emr" {
+  source = "./modules/emr"
+
+  project_name    = var.project_name
+  aws_region      = var.aws_region
+  release_label   = var.emr_release_label
+  s3_bucket_arn   = module.storage.s3_bucket_arn
+  msk_cluster_arn = module.kafka.msk_serverless_cluster_arn
+  tags            = local.common_tags
+}

@@ -33,3 +33,6 @@ ec2_instance_type              = "t3.large"
 ec2_volume_type                = "gp3"
 ec2_volume_size                = 30
 ec2_enable_detailed_monitoring = false
+
+# ------- EMR Serverless Module ------- 
+emr_release_label = "emr-7.13.0"

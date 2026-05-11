@@ -60,3 +60,8 @@ variable "ec2_volume_size" {
 variable "ec2_enable_detailed_monitoring" {
   type = bool
 }
+
+# ------- EMR Serverless Module -------
+variable "emr_release_label" {
+  type = string
+}
