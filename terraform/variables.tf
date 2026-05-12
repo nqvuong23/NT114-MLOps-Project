@@ -65,3 +65,29 @@ variable "ec2_enable_detailed_monitoring" {
 variable "emr_release_label" {
   type = string
 }
+
+# ------- MWAA Module -------
+variable "mwaa_airflow_version" {
+  type        = string
+  description = "Apache Airflow version for the MWAA environment"
+}
+
+variable "mwaa_environment_class" {
+  type        = string
+  description = "MWAA environment class (mw1.micro, mw1.small, mw1.medium, ...)"
+}
+
+variable "mwaa_min_workers" {
+  type        = number
+  description = "Minimum number of MWAA workers"
+}
+
+variable "mwaa_max_workers" {
+  type        = number
+  description = "Maximum number of MWAA workers"
+}
+
+variable "mwaa_schedulers" {
+  type        = number
+  description = "Number of MWAA schedulers"
+}

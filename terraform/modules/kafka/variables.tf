@@ -13,6 +13,10 @@ variable "public_subnet_ids" {
   description = "List of public subnet IDs imported from the networking module (expects at least 2)"
 }
 
+variable "security_group_id" {
+  type = list(string)
+}
+
 variable "tags" {
   type        = map(string)
   default     = {}

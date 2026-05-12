@@ -8,7 +8,3 @@ output "msk_serverless_cluster_name" {
   value       = aws_msk_serverless_cluster.main.cluster_name
 }
 
-output "msk_security_group_id" {
-  description = "Security group ID attached to the Serverless MSK cluster"
-  value       = aws_security_group.msk_serverless.id
-}

@@ -23,6 +23,16 @@ variable "release_label" {
   description = "EMR release label (e.g. emr-7.13.0)"
 }
 
+variable "subnet_ids" {
+  type        = list(string)
+  description = "List of subnet IDs for the EMR application network configuration"
+}
+
+variable "security_group_ids" {
+  type        = list(string)
+  description = "List of security group IDs for the EMR application network configuration"
+}
+
 variable "tags" {
   type        = map(string)
   default     = {}

@@ -201,25 +201,13 @@ resource "aws_emrserverless_application" "spark" {
   release_label = var.release_label
   architecture  = "X86_64"
 
-  # initial_capacity = 0 — no pre-provisioned workers, no idle cost.
-  # Workers are allocated on-demand when a job run is submitted.
-  # Omitting the initial_capacity block entirely achieves capacity = 0.
-
   maximum_capacity {
     cpu    = "200 vCPU"
     memory = "200 GB"
   }
 
-  auto_start_configuration {
-    enabled = true
+  network_configuration {
+    security_group_ids = var.security_group_ids
+    subnet_ids         = var.subnet_ids
   }
-
-  auto_stop_configuration {
-    enabled              = true
-    idle_timeout_minutes = 15
-  }
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-spark"
-  })
 }
