@@ -36,10 +36,3 @@ ec2_enable_detailed_monitoring = false
 
 # ------- EMR Serverless Module ------- 
 emr_release_label = "emr-7.13.0"
-
-# ------- MWAA Module -------
-mwaa_airflow_version   = "2.10.3"
-mwaa_environment_class = "mw1.small"
-mwaa_min_workers       = 1
-mwaa_max_workers       = 3
-mwaa_schedulers        = 2

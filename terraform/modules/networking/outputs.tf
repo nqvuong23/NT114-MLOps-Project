@@ -14,8 +14,8 @@ output "msk_serverless_security_group_id" {
   value = aws_security_group.msk_serverless.id
 }
 
-output "mwaa_security_group_id" {
-  value = aws_security_group.mwaa.id
+output "apache_airflow_security_group_id" {
+  value = aws_security_group.apache_airflow.id
 }
 
 output "vpc_id" {

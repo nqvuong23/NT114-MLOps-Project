@@ -196,28 +196,17 @@ resource "aws_security_group" "msk_serverless" {
   })
 }
 
-# ------- Security Group for AWS MWAA -------
-resource "aws_security_group" "mwaa" {
-  name        = "${var.project_name}-mwaa-sg"
-  description = "Security group for MWAA environment"
-  vpc_id      = aws_vpc.main.id
+# ------- Security Group for Apache Airflow -------
+resource "aws_security_group" "apache_airflow" {
+  name   = "${var.project_name}-apache-airflow-sg"
+  vpc_id = aws_vpc.main.id
 
-  # MWAA workers / schedulers communicate with each other on all ports
   ingress {
-    description = "Self-referencing ingress for MWAA internal traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    self        = true
-  }
-
-  # HTTPS inbound — required for Airflow web server access and VPC endpoint traffic
-  ingress {
-    description = "HTTPS from VPC"
-    from_port   = 443
-    to_port     = 443
+    description = "Airflow Web UI"
+    from_port   = 8080
+    to_port     = 8080
     protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
+    cidr_blocks = ["0.0.0.0/0"] 
   }
 
   egress {
@@ -228,88 +217,6 @@ resource "aws_security_group" "mwaa" {
   }
 
   tags = merge(var.tags, {
-    Name = "${var.project_name}-mwaa-sg"
-  })
-}
-
-# ------- VPC Interface Endpoints required by MWAA -------
-# MWAA uses SQS, CloudWatch Logs, CloudWatch Monitoring, KMS, and ECR
-# when running in a private subnet without direct internet access.
-
-resource "aws_vpc_endpoint" "sqs" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.sqs"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.mwaa.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-sqs-endpoint"
-  })
-}
-
-resource "aws_vpc_endpoint" "cloudwatch_logs" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.logs"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.mwaa.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-cwlogs-endpoint"
-  })
-}
-
-resource "aws_vpc_endpoint" "cloudwatch_monitoring" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.monitoring"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.mwaa.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-monitoring-endpoint"
-  })
-}
-
-resource "aws_vpc_endpoint" "kms" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.kms"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.mwaa.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-kms-endpoint"
-  })
-}
-
-resource "aws_vpc_endpoint" "ecr_api" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.ecr.api"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.mwaa.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-ecr-api-endpoint"
-  })
-}
-
-resource "aws_vpc_endpoint" "ecr_dkr" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.ecr.dkr"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.mwaa.id]
-  private_dns_enabled = true
-
-  tags = merge(var.tags, {
-    Name = "${var.project_name}-ecr-dkr-endpoint"
+    Name = "${var.project_name}-apache-airflow-sg"
   })
 }

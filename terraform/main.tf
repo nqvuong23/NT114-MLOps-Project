@@ -44,7 +44,7 @@ module "computing" {
   ec2_volume_size                = var.ec2_volume_size
   ec2_enable_detailed_monitoring = var.ec2_enable_detailed_monitoring
   vpc_subnet_id                  = module.networking.public_subnet_ids[1]
-  security_group_id              = module.networking.emr_serverless_security_group_id
+  security_group_ids             = [module.networking.apache_airflow_security_group_id]
   s3_bucket_arn                  = module.storage.s3_bucket_arn
   tags                           = local.common_tags
 
@@ -78,21 +78,3 @@ module "emr" {
   tags               = local.common_tags
 }
 
-# ------- Module: MWAA (Managed Airflow) -------
-module "mwaa" {
-  source = "./modules/mwaa"
-
-  project_name            = var.project_name
-  aws_region              = var.aws_region
-  vpc_id                  = module.networking.vpc_id
-  private_subnet_ids      = module.networking.private_subnet_ids
-  mwaa_security_group_ids = [module.networking.mwaa_security_group_id]
-  airflow_version         = var.mwaa_airflow_version
-  environment_class       = var.mwaa_environment_class
-  min_workers             = var.mwaa_min_workers
-  max_workers             = var.mwaa_max_workers
-  schedulers              = var.mwaa_schedulers
-  tags                    = local.common_tags
-
-  depends_on = [module.networking]
-}

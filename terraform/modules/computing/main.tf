@@ -65,8 +65,8 @@ resource "aws_iam_policy" "ec2_s3_policy" {
 }
 
 resource "aws_iam_role_policy_attachment" "ec2_s3_access" {
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-  role       = aws_iam_policy.ec2_s3_policy.arn
+  policy_arn = aws_iam_policy.ec2_s3_policy.arn
+  role       = aws_iam_role.ec2_instance_role.name
 }
 
 resource "aws_iam_instance_profile" "ec2_profile" {
@@ -83,7 +83,7 @@ resource "aws_instance" "main" {
   ami                    = var.ec2_ami_id
   instance_type          = var.ec2_instance_type
   subnet_id              = var.vpc_subnet_id
-  vpc_security_group_ids = [var.security_group_id]
+  vpc_security_group_ids = var.security_group_ids
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
   root_block_device {
