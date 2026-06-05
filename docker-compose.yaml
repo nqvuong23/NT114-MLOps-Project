@@ -96,6 +96,8 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
@@ -333,5 +335,63 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: airflow_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_password
+    command: server /data --console-address ":9001"
+    volumes:
+      - mlflow_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mc:
+    image: quay.io/minio/mc:RELEASE.2024-05-09T17-04-24Z
+    container_name: airflow_mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minio_admin minio_password;
+      mc mb --ignore-existing myminio/mlflow-bucket;
+      exit 0;
+      "
+
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: airflow_mlflow_server
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=minio_admin
+      - AWS_SECRET_ACCESS_KEY=minio_password
+      - AWS_DEFAULT_REGION=us-east-1
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - MLFLOW_S3_IGNORE_TLS=true
+    entrypoint: >
+      /bin/sh -c "
+      pip install --no-cache-dir psycopg2-binary boto3 &&
+      mlflow server
+      --backend-store-uri postgresql://airflow:airflow@postgres:5432/airflow
+      --default-artifact-root s3://mlflow-bucket/
+      --host 0.0.0.0
+      --port 5000
+      "
+
 volumes:
   postgres-db-volume:
+  mlflow_minio_data:

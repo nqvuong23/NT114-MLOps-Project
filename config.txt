@@ -1,0 +1,52 @@
+HƯỚNG DẪN CÀI ĐẶT VÀ SỬ DỤNG TOOL GIAI ĐOẠN 2 (XGBoost, Optuna, MLflow)
+========================================================================
+
+1. CÀI ĐẶT MÔI TRƯỜNG PYTHON (LOCAL)
+--------------------------------------
+Tạo một môi trường ảo (virtual environment) và cài đặt các thư viện cần thiết:
+
+# Bước 1: Tạo môi trường ảo
+python -m venv venv
+
+# Bước 2: Kích hoạt môi trường ảo
+# Trên Windows:
+.\venv\Scripts\activate
+# Trên Linux/macOS:
+source venv/bin/activate
+
+# Bước 3: Cài đặt các thư viện từ requirements.txt
+pip install -r requirements.txt
+
+
+2. CHẠY MLFLOW TRÊN DOCKER COMPOSE
+--------------------------------------
+
+CÁCH A: Chạy thử độc lập (để kiểm tra trước)
+Chạy tệp docker-compose.mlflow.yaml để khởi động Postgres + MinIO + MLflow Server:
+    docker compose -f docker-compose.mlflow.yaml up -d
+
+CÁCH B: Chạy tích hợp chung với Airflow (khi chạy toàn bộ hệ thống)
+Chạy tệp docker-compose.yaml thông thường để khởi động toàn bộ dịch vụ (Airflow, Redis, Postgres, MLflow, MinIO):
+    docker compose up -d
+
+Địa chỉ truy cập các dịch vụ:
+- MLflow Dashboard: http://localhost:5000
+- MinIO Web Console (S3 Mock): http://localhost:9001
+  * Tài khoản: minio_admin
+  * Mật khẩu: minio_password
+  * Bucket lưu model artifacts: mlflow-bucket
+
+
+3. HUẤN LUYỆN TRÊN DỮ LIỆU THẬT (creditcard.csv)
+--------------------------------------
+Khi đã có tệp `creditcard.csv` trong thư mục gốc, bạn có thể chạy tệp huấn luyện:
+    python train_real_data.py
+
+Tập lệnh này sẽ:
+1. Đọc dữ liệu từ file `creditcard.csv` thật (284,807 dòng).
+2. Phân tách Train/Test theo thời gian thực (Time-based split 80/20) để đảm bảo mô phỏng thực tế.
+3. Chạy 15 trials Optuna tối ưu tham số và log đầy đủ lên MLflow.
+4. Huấn luyện mô hình XGBoost tốt nhất với scale_pos_weight tự động và đăng ký phiên bản mới vào MLflow Registry.
+
+* Lưu ý khi kiểm tra kết quả trên MLflow Web UI (http://localhost:5000):
+  Mặc định MLflow có thể hiển thị giao diện của "GenAI". Ở góc trên bên trái (ngay dưới logo mlflow), hãy bấm chuyển nút toggle từ "GenAI" sang "Model training", sau đó chọn "Runs" hoặc "Models" ở menu bên trái để thấy đầy đủ các tham số và phiên bản mô hình XGBoost đã huấn luyện.

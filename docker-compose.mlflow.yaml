@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  mlflow-db:
+    image: postgres:16
+    container_name: mlflow_postgres
+    environment:
+      POSTGRES_USER: mlflow_user
+      POSTGRES_PASSWORD: mlflow_password
+      POSTGRES_DB: mlflow_db
+    ports:
+      - "5433:5432" # Dùng cổng 5433 để tránh xung đột với Postgres của Airflow (5432)
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow_user -d mlflow_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: mlflow_minio
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO Console
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_password
+    command: server /data --console-address ":9001"
+    volumes:
+      - mlflow_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mc:
+    image: quay.io/minio/mc:RELEASE.2024-05-09T17-04-24Z
+    container_name: mlflow_mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minio_admin minio_password;
+      mc mb --ignore-existing myminio/mlflow-bucket;
+      exit 0;
+      "
+
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: mlflow_server
+    ports:
+      - "5000:5000"
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=minio_admin
+      - AWS_SECRET_ACCESS_KEY=minio_password
+      - AWS_DEFAULT_REGION=us-east-1
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - MLFLOW_S3_IGNORE_TLS=true
+    entrypoint: >
+      /bin/sh -c "
+      pip install --no-cache-dir psycopg2-binary boto3 &&
+      mlflow server
+      --backend-store-uri postgresql://mlflow_user:mlflow_password@mlflow-db:5432/mlflow_db
+      --default-artifact-root s3://mlflow-bucket/
+      --host 0.0.0.0
+      --port 5000
+      "
+
+volumes:
+  mlflow_db_data:
+  mlflow_minio_data:

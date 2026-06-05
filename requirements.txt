@@ -1,0 +1,6 @@
+xgboost
+optuna
+mlflow
+psycopg2-binary
+boto3
+scikit-learn
