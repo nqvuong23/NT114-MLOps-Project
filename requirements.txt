@@ -3,9 +3,8 @@ optuna
 mlflow
 psycopg2-binary
 boto3
+botocore
 scikit-learn 
-boto3 
 pandas 
 pyarrow 
-great-expectations==0.18.12 
-dvc[s3]
+great-expectations

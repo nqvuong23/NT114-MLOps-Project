@@ -59,4 +59,4 @@ __pycache__/
 *.pyd
 .ipynb_checkpoints/
 
-.env.production
+*.pem

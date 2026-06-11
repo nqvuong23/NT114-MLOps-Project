@@ -8,125 +8,17 @@ git clone https://github.com/nqvuong23/NT114-MLOps-Project.git  nt114-mlops
 cd nt114-mlops
 ```
 
-## Cài các package cần thiết
-
-```
-sudo apt install -y python3 python3-venv python3-pip unzip git
-```
-
-## Cài đặt AWS CLI
-
-```
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-sudo ./aws/install
-```
-
-## Cài đặt Docker
-
-```
-sudo apt remove $(dpkg --get-selections docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc | cut -f1)
-```
-
-```
-sudo apt update
-sudo apt install ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-```
-
-- Copy toàn bộ các dòng trong block code sau:
-
-```
-sudo tee /etc/apt/sources.list.d/docker.sources <<EOF
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-```
-
-```
-sudo apt update
-sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-```
-
-```
-sudo usermod -aG docker $USER
-
-sudo systemctl enable docker
-sudo systemctl start docker
-sudo systemctl status docker
-```
-
-## Deploy Apache Airflow và MLflow
-
-- Nếu dùng máy ảo để deploy thì hãy pull source code từ Repository của GitHub
-
-```
-# Di chuyển vào thư mục root của project
-docker compose up -d
-```
-
-## Deploy Apache Spark
-
-1. Cài Java Runtime
-
-```
-sudo apt update
-sudo apt install openjdk-21-jre
-java -version
-```
-
-2. Cài Apache Spark
-
-- Tải và giải nén Apache Spark
-
-```
-curl -O https://dlcdn.apache.org/spark/spark-4.0.2/spark-4.0.2-bin-hadoop3.tgz
-tar -xvf spark-4.0.2-bin-hadoop3.tgz
-sudo mv spark-4.0.2-bin-hadoop3 /opt/spark
-```
-
-- Cấu hình biến môi trường
-
-```
-# Mở file
-nano ~/.bashrc
-```
-
-```
-# Cấu hình đường dẫn cho Apache Spark (thêm các dòng sau vào file)
-export SPARK_HOME=/opt/spark
-export PATH=$PATH:$SPARK_HOME/bin:$SPARK_HOME/sbin
-export PYSPARK_PYTHON=python3
-```
-
-```
-# Sau khi lưu và thoát file, chạy lệnh sau để apply thay đổi
-source ~/.bashrc
-```
-
-3. Kiểm tra
-
-```
-spark-shell
-```
-
 ## Chạy script cấu hình AWS RDS
 
 ```
-python3 -m venv venv
-source ./venv/bin/activate
-pip install -r requirements.txt
+# Tải file global-bundle.pem
+curl -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+```
 
+**Thêm giá trị cho biến môi trường trong file `.env.production`**
+
+```
 # Chạy script setup
 chmod +x scripts/setup.sh
 bash scripts/setup.sh
 ```
-
-## Deploy DVC
-
