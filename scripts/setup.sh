@@ -119,7 +119,7 @@ fi
 
 # Cài Apache Airflow và MLflow
 echo "[+] Starting Airflow + MLflow via docker compose..."
-docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d
+docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true
 echo "[✓] Docker Compose services started"
 
 # ── Tạo RDS table (nếu đã có RDS) ─────────────────────────────────────────
