@@ -3,8 +3,10 @@
 ## Clone và setup project
 
 ```
+sudo apt update
+sudo apt install -y git
 cd ~
-git clone https://github.com/nqvuong23/NT114-MLOps-Project.git  nt114-mlops
+git clone https://github.com/nqvuong23/NT114-MLOps-Project.git nt114-mlops
 cd nt114-mlops
 ```
 

@@ -13,7 +13,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Tải các package cần thiết
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip unzip git ca-certificates curl tar
+sudo apt install -y python3 python3-venv python3-pip unzip ca-certificates curl tar
 
 # Cài các thư viện của Python
 pip3 install -r "${PROJECT_ROOT}/requirements.txt"
