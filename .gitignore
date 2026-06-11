@@ -60,3 +60,5 @@ __pycache__/
 .ipynb_checkpoints/
 
 *.pem
+
+.env

@@ -17,6 +17,11 @@ cd nt114-mlops
 curl -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 ```
 
+```
+# Copy và customize giá trị của biến môi trường để sử dụng (QUAN TRỌNG)
+cp .env.example .env
+```
+
 **Thêm giá trị cho biến môi trường trong file `.env.production`**
 
 ```

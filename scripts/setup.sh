@@ -110,10 +110,10 @@ else
 fi
 
 # ── Load env ──────────────────────────────────────────────────────────────────
-if [ -f "$PROJECT_ROOT/.env.production" ]; then
-    export $(grep -v '^#' "$PROJECT_ROOT/.env.production" | xargs)
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    export $(grep -v '^#' "$PROJECT_ROOT/.env" | xargs)
 else
-    echo "[✗] .env.production not found!"
+    echo "[✗] .env not found!"
     exit 1
 fi
 
@@ -122,27 +122,66 @@ echo "[+] Starting Airflow + MLflow via docker compose..."
 docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true
 echo "[✓] Docker Compose services started"
 
-# ── Tạo RDS table (nếu đã có RDS) ─────────────────────────────────────────
+# ── Tạo RDS Databases và Table ─────────────────────────────────────────
 echo ""
-echo "[4/4] Setting up RDS table..."
+echo "[4/4] Setting up RDS Databases and Tables..."
 
 if python3 -c "import psycopg2" 2>/dev/null; then
     python3 << PYEOF
 import os, psycopg2, sys
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 try:
-    conn = psycopg2.connect(
+    # Bước 1: Kết nối tới DB mặc định 'postgres' để có quyền tạo DB mới
+    admin_conn = psycopg2.connect(
         host=os.environ['RDS_HOST'],
         port=int(os.environ.get('RDS_PORT', 5432)),
-        database=os.environ['RDS_DB'],
+        database=os.environ['RDS_DEFAULT_DB'],  
         user=os.environ['RDS_USER'],
         password=os.environ['RDS_PASSWORD'],
         sslmode=os.environ.get('RDS_SSLMODE', 'verify-full'),
         sslrootcert=os.environ.get('RDS_SSLROOTCERT', './global-bundle.pem'),
         connect_timeout=10,
     )
-    print("[✓] RDS connection OK")
+    # Bắt buộc phải bật autocommit để chạy lệnh CREATE DATABASE
+    admin_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+    admin_cur = admin_conn.cursor()
 
+    tx_db = os.environ['RDS_TRANSACTIONS_DB']
+    mlflow_db = os.environ['RDS_MLFLOW_DB']
+
+    # Kiểm tra và tạo database Transactions
+    admin_cur.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{tx_db}';")
+    if not admin_cur.fetchone():
+        print(f"[*] Creating database '{tx_db}'...")
+        admin_cur.execute(f"CREATE DATABASE {tx_db};")
+    else:
+        print(f"[✓] Database '{tx_db}' already exists")
+
+    # Kiểm tra và tạo database MLflow
+    admin_cur.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{mlflow_db}';")
+    if not admin_cur.fetchone():
+        print(f"[*] Creating database '{mlflow_db}'...")
+        admin_cur.execute(f"CREATE DATABASE {mlflow_db};")
+    else:
+        print(f"[✓] Database '{mlflow_db}' already exists")
+
+    admin_cur.close()
+    admin_conn.close()
+
+    # Bước 2: Kết nối trực tiếp vào database Transactions để tạo bảng
+    print(f"[*] Connecting to '{tx_db}' to create tables...")
+    conn = psycopg2.connect(
+        host=os.environ['RDS_HOST'],
+        port=int(os.environ.get('RDS_PORT', 5432)),
+        database=tx_db, 
+        user=os.environ['RDS_USER'],
+        password=os.environ['RDS_PASSWORD'],
+        sslmode=os.environ.get('RDS_SSLMODE', 'verify-full'),
+        sslrootcert=os.environ.get('RDS_SSLROOTCERT', './global-bundle.pem'),
+        connect_timeout=10,
+    )
+    
     v_cols = "\n".join([f'    "V{i}" DOUBLE PRECISION,' for i in range(1, 29)])
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -166,10 +205,10 @@ try:
         """)
     conn.commit()
     conn.close()
-    print("[✓] RDS table 'transactions' ready")
+    print(f"[✓] RDS table 'transactions' ready inside '{tx_db}'")
+
 except Exception as e:
-    print(f"[!] RDS setup skipped: {e}")
-    print("    Run scripts/simulate_transactions.py with --setup to create table later")
+    print(f"[!] RDS setup failed: {e}")
 PYEOF
 else
     echo "[!] psycopg2 not installed — skipping RDS setup"
