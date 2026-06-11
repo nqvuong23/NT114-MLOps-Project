@@ -10,13 +10,29 @@ echo "========================================="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VENV_DIR="${PROJECT_ROOT}/.venv"
 
 # Tải các package cần thiết
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip unzip ca-certificates curl tar
 
+# ── Tạo và kích hoạt Virtual Environment ─────────────────────────────────────
+if [ ! -d "$VENV_DIR" ]; then
+    echo "[+] Creating Python virtual environment at $VENV_DIR ..."
+    python3 -m venv "$VENV_DIR"
+    echo "[✓] Virtual environment created"
+else
+    echo "[✓] Virtual environment already exists — skipping creation"
+fi
+ 
+# shellcheck source=/dev/null
+source "${VENV_DIR}/bin/activate"
+echo "[✓] Virtual environment activated: ${VIRTUAL_ENV}"
+
+pip install --upgrade pip --quiet
+
 # Cài các thư viện của Python
-pip3 install -r "${PROJECT_ROOT}/requirements.txt"
+pip install -r "${PROJECT_ROOT}/requirements.txt"
 
 # Cài AWS CLI
 if ! command -v aws &>/dev/null; then
@@ -50,14 +66,14 @@ if ! command -v docker &>/dev/null; then
         exit 1
     fi
  
-    sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+    sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<DOCKEREOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
 Suites: ${UBUNTU_CODENAME}
 Components: stable
 Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.asc
-EOF
+DOCKEREOF
  
     sudo apt-get update
     sudo apt-get install -y \
@@ -164,8 +180,7 @@ echo "========================================="
 # ── Cài DVC + S3 support ───────────────────────────────────────────────────
 if ! command -v dvc &>/dev/null; then
     echo "[1/5] Installing DVC with S3 support..."
-    # FIX: dùng pip3
-    pip3 install "dvc[s3]" --quiet
+    pip install "dvc[s3]" --quiet
     echo "[✓] DVC installed: $(dvc --version)"
 else
     echo "[1/5] DVC already installed: $(dvc --version) — skipping"
