@@ -43,7 +43,8 @@ terraform.rc
 # Uncomment the line below if you want to ignore planout files.
 # planout
 
-logs/
+airflow/logs/*
+airflow/config/*
 
 # Python virtual environment
 venv/
@@ -51,12 +52,11 @@ venv/
 # Large datasets
 *.csv
 
-# Environment variables containing secrets
-.env
-
 # Python cache files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .ipynb_checkpoints/
+
+.env.production

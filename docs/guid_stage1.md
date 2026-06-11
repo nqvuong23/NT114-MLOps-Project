@@ -1,5 +1,27 @@
 # Hướng dẫn deploy các tool cho MLOps
 
+## Clone và setup project
+
+```
+cd ~
+git clone https://github.com/nqvuong23/NT114-MLOps-Project.git  nt114-mlops
+cd nt114-mlops
+```
+
+## Cài các package cần thiết
+
+```
+sudo apt install -y python3 python3-venv python3-pip unzip git
+```
+
+## Cài đặt AWS CLI
+
+```
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
 ## Cài đặt Docker
 
 ```
@@ -93,3 +115,18 @@ source ~/.bashrc
 ```
 spark-shell
 ```
+
+## Chạy script cấu hình AWS RDS
+
+```
+python3 -m venv venv
+source ./venv/bin/activate
+pip install -r requirements.txt
+
+# Chạy script setup
+chmod +x scripts/setup.sh
+bash scripts/setup.sh
+```
+
+## Deploy DVC
+

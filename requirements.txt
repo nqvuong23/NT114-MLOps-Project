@@ -3,4 +3,9 @@ optuna
 mlflow
 psycopg2-binary
 boto3
-scikit-learn
+scikit-learn 
+boto3 
+pandas 
+pyarrow 
+great-expectations==0.18.12 
+dvc[s3]

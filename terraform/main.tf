@@ -51,30 +51,3 @@ module "computing" {
   depends_on = [module.networking]
 }
 
-# ------- Module: Kafka (Serverless MSK) -------
-module "kafka" {
-  source = "./modules/kafka"
-
-  project_name      = var.project_name
-  vpc_id            = module.networking.vpc_id
-  public_subnet_ids = module.networking.public_subnet_ids
-  security_group_id = [module.networking.msk_serverless_security_group_id]
-  tags              = local.common_tags
-
-  depends_on = [module.networking]
-}
-
-# ------- Module: EMR Serverless -------
-module "emr" {
-  source = "./modules/emr"
-
-  project_name       = var.project_name
-  aws_region         = var.aws_region
-  release_label      = var.emr_release_label
-  s3_bucket_arn      = module.storage.s3_bucket_arn
-  msk_cluster_arn    = module.kafka.msk_serverless_cluster_arn
-  subnet_ids         = module.networking.private_subnet_ids
-  security_group_ids = [module.networking.emr_serverless_security_group_id]
-  tags               = local.common_tags
-}
-
