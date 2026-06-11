@@ -117,11 +117,6 @@ else
     exit 1
 fi
 
-# Cài Apache Airflow và MLflow
-echo "[+] Starting Airflow + MLflow via docker compose..."
-docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true
-echo "[✓] Docker Compose services started"
-
 # ── Tạo RDS Databases và Table ─────────────────────────────────────────
 echo ""
 echo "[4/4] Setting up RDS Databases and Tables..."
@@ -214,6 +209,11 @@ else
     echo "[!] psycopg2 not installed — skipping RDS setup"
     echo "    Install: pip install psycopg2-binary"
 fi
+
+# Cài Apache Airflow và MLflow
+echo "[+] Starting Airflow + MLflow via docker compose..."
+docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true
+echo "[✓] Docker Compose services started"
 
 echo ""
 echo "========================================="
