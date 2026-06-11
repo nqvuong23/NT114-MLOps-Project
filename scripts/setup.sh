@@ -91,14 +91,23 @@ fi
 # Cài Apache Spark
 mkdir -p ~/spark_notebooks
 chmod 777 ~/spark_notebooks
-echo "[+] Starting Spark notebook container..."
-docker run -d \
-  --name my_spark_lab \
-  -p 8888:8888 \
-  -p 4040:4040 \
-  -v ~/spark_notebooks:/home/jovyan/work \
-  jupyter/pyspark-notebook
-echo "[✓] Spark container started"
+
+if docker ps -a --format '{{.Names}}' | grep -q '^my_spark_lab$'; then
+    echo "[✓] Spark container 'my_spark_lab' already exists — skipping"
+    if ! docker ps --format '{{.Names}}' | grep -q '^my_spark_lab$'; then
+        echo "[+] Starting existing Spark container..."
+        docker start my_spark_lab
+    fi
+else
+    echo "[+] Starting Spark notebook container..."
+    docker run -d \
+        --name my_spark_lab \
+        -p 8888:8888 \
+        -p 4040:4040 \
+        -v ~/spark_notebooks:/home/jovyan/work \
+        jupyter/pyspark-notebook
+    echo "[✓] Spark container started"
+fi
 
 # ── Load env ──────────────────────────────────────────────────────────────────
 if [ -f "$PROJECT_ROOT/.env.production" ]; then
