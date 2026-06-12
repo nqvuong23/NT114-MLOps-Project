@@ -1,0 +1,8 @@
+boto3
+pandas
+numpy
+psycopg2-binary
+requests 
+pyarrow
+great-expectations
+slack-sdk

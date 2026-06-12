@@ -211,6 +211,11 @@ else
 fi
 
 # Cài Apache Airflow và MLflow
+echo "[+] Setting Airflow directory permissions..."
+sudo mkdir -p "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
+sudo chown -R 50000:0 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
+sudo chmod -R 775 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
+
 echo "[+] Starting Airflow + MLflow via docker compose..."
 docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true
 echo "[✓] Docker Compose services started"
