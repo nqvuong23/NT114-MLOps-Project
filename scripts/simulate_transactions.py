@@ -138,8 +138,6 @@ def get_db_connection():
         database=os.environ["RDS_TRANSACTIONS_DB"],
         user=os.environ["RDS_USER"],
         password=os.environ["RDS_PASSWORD"],
-        sslmode=os.environ.get('RDS_SSLMODE', 'verify-full'),
-        sslrootcert=os.environ.get('RDS_SSLROOTCERT', './global-bundle.pem'),
         connect_timeout=10,
     )
 

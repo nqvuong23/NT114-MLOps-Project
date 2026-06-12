@@ -23,7 +23,6 @@ import boto3
 import psycopg2
 from airflow import DAG
 from airflow.models import Variable, DagRun
-# FIX Airflow 3.x: dùng provider package thay vì core
 from airflow.providers.standard.operators.python import PythonOperator
 
 import sys
@@ -223,7 +222,7 @@ def check_rds_connectivity(**context):
         conn = psycopg2.connect(
             host=os.environ["RDS_HOST"],
             port=int(os.environ.get("RDS_PORT", 5432)),
-            database=os.environ["RDS_DB"],
+            database=os.environ["RDS_TRANSACTIONS_DB"],
             user=os.environ["RDS_USER"],
             password=os.environ["RDS_PASSWORD"],
             connect_timeout=10,

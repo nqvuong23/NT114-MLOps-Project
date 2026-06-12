@@ -96,10 +96,10 @@ def get_rds_conn():
     return psycopg2.connect(
         host=os.environ["RDS_HOST"],
         port=int(os.environ.get("RDS_PORT", 5432)),
-        database=os.environ["RDS_DB"],
+        database=os.environ["RDS_TRANSACTIONS_DB"],
         user=os.environ["RDS_USER"],
         password=os.environ["RDS_PASSWORD"],
-        connect_timeout=30,
+        connect_timeout=10,
     )
 
 

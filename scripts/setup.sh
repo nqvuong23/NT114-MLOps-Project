@@ -134,8 +134,6 @@ try:
         database=os.environ['RDS_DEFAULT_DB'],  
         user=os.environ['RDS_USER'],
         password=os.environ['RDS_PASSWORD'],
-        sslmode=os.environ.get('RDS_SSLMODE', 'verify-full'),
-        sslrootcert=os.environ.get('RDS_SSLROOTCERT', './global-bundle.pem'),
         connect_timeout=10,
     )
     # Bắt buộc phải bật autocommit để chạy lệnh CREATE DATABASE
@@ -172,8 +170,6 @@ try:
         database=tx_db, 
         user=os.environ['RDS_USER'],
         password=os.environ['RDS_PASSWORD'],
-        sslmode=os.environ.get('RDS_SSLMODE', 'verify-full'),
-        sslrootcert=os.environ.get('RDS_SSLROOTCERT', './global-bundle.pem'),
         connect_timeout=10,
     )
     
