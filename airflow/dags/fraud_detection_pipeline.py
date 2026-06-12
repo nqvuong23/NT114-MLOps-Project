@@ -31,8 +31,7 @@ import psycopg2
 import requests
 from airflow import DAG
 from airflow.models import Variable
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from airflow.providers.standard.operators.python import PythonOperator
 
 # Import từ plugins
 import sys
@@ -44,7 +43,7 @@ from alert_utils import send_alert, airflow_failure_callback
 logger = logging.getLogger(__name__)
 
 # ── Config từ Environment ────────────────────────────────────────────────────
-S3_BUCKET        = os.environ["S3_BUCKET"]
+S3_BUCKET        = os.environ.get("S3_BUCKET", "")
 S3_RAW           = os.environ.get("S3_RAW_PREFIX", "raw-data")
 S3_PROCESSED     = os.environ.get("S3_PROCESSED_PREFIX", "processed-data")
 S3_FEATURE       = os.environ.get("S3_FEATURE_PREFIX", "feature-store")
@@ -74,10 +73,10 @@ default_args = {
 dag = DAG(
     dag_id="fraud_detection_preprocessing",
     description="Batch preprocessing pipeline: RDS → S3 → Spark → GE → API → DVC",
-    schedule_interval="*/5 * * * *",   # Mỗi 5 phút
-    start_date=days_ago(1),
-    catchup=False,                      # Không chạy bù các lần bỏ lỡ
-    max_active_runs=1,                  # Chỉ 1 run tại một thời điểm
+    schedule="*/5 * * * *",                           # Mỗi 5 phút
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    catchup=False,                                    # Không chạy bù các lần bỏ lỡ
+    max_active_runs=1,                                # Chỉ 1 run tại một thời điểm
     default_args=default_args,
     tags=["fraud-detection", "preprocessing", "mlops"],
 )

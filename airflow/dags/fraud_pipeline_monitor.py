@@ -23,9 +23,8 @@ import boto3
 import psycopg2
 from airflow import DAG
 from airflow.models import Variable, DagRun
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
-from airflow.utils.state import State
+# FIX Airflow 3.x: dùng provider package thay vì core
+from airflow.providers.standard.operators.python import PythonOperator
 
 import sys
 sys.path.insert(0, "/opt/airflow/plugins")
@@ -33,7 +32,7 @@ from alert_utils import send_alert, airflow_failure_callback
 
 logger = logging.getLogger(__name__)
 
-S3_BUCKET      = os.environ["S3_BUCKET"]
+S3_BUCKET      = os.environ.get("S3_BUCKET", "")
 S3_FEATURE     = os.environ.get("S3_FEATURE_PREFIX", "feature-store")
 S3_DEAD_LETTER = os.environ.get("S3_DEAD_LETTER_PREFIX", "dead-letter")
 AWS_REGION     = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
@@ -46,11 +45,14 @@ default_args = {
     "on_failure_callback": airflow_failure_callback,
 }
 
+# FIX Airflow 3.x:
+#   - days_ago() bị xóa → dùng datetime trực tiếp
+#   - schedule_interval= bị xóa → dùng schedule=
 monitor_dag = DAG(
     dag_id="fraud_pipeline_monitor",
     description="Health monitoring for fraud detection preprocessing pipeline",
-    schedule_interval="*/15 * * * *",
-    start_date=days_ago(1),
+    schedule="*/15 * * * *",
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
@@ -63,22 +65,32 @@ def check_recent_batches(**context):
     Kiểm tra DAG 'fraud_detection_preprocessing' có chạy thành công
     trong 30 phút qua không.
     """
-    from airflow.models import DagRun
-    from airflow.utils.session import create_session
+    # FIX Airflow 3.x:
+    #   - create_session bị xóa → dùng NEW_SESSION / provide_session
+    #   - State.SUCCESS → dùng string "success" trực tiếp
+    #   - execution_date → logical_date trong Airflow 3.x
+    from airflow.utils.session import NEW_SESSION, provide_session
+    from sqlalchemy.orm import Session
 
     threshold = datetime.now(tz=timezone.utc) - timedelta(minutes=30)
 
-    with create_session() as session:
-        recent_runs = (
-            session.query(DagRun)
+    from airflow.models.dagrun import DagRun as DR
+    from airflow.utils.db import provide_session as db_session
+
+    @db_session
+    def _query(session: Session = NEW_SESSION):
+        return (
+            session.query(DR)
             .filter(
-                DagRun.dag_id == "fraud_detection_preprocessing",
-                DagRun.execution_date >= threshold,
+                DR.dag_id == "fraud_detection_preprocessing",
+                DR.logical_date >= threshold,
             )
-            .order_by(DagRun.execution_date.desc())
+            .order_by(DR.logical_date.desc())
             .limit(10)
             .all()
         )
+
+    recent_runs = _query()
 
     if not recent_runs:
         send_alert(
@@ -90,8 +102,9 @@ def check_recent_batches(**context):
         context["ti"].xcom_push(key="pipeline_status", value="no_runs")
         return
 
-    success_runs = [r for r in recent_runs if r.state == State.SUCCESS]
-    failed_runs  = [r for r in recent_runs if r.state == State.FAILED]
+    # FIX Airflow 3.x: dùng string state thay vì State enum
+    success_runs = [r for r in recent_runs if r.state == "success"]
+    failed_runs  = [r for r in recent_runs if r.state == "failed"]
 
     logger.info(f"Recent runs: {len(recent_runs)} | success: {len(success_runs)} | failed: {len(failed_runs)}")
 
@@ -100,7 +113,7 @@ def check_recent_batches(**context):
             subject=f"Pipeline FAILING — {len(failed_runs)} consecutive failures",
             message=f"Last {len(failed_runs)} runs all failed. Immediate attention required.",
             level="error",
-            context={"failed_count": len(failed_runs), "last_run": str(failed_runs[0].execution_date)}
+            context={"failed_count": len(failed_runs), "last_run": str(failed_runs[0].logical_date)}
         )
     elif failed_runs:
         send_alert(
