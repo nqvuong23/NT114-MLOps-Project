@@ -135,9 +135,12 @@ def get_db_connection():
     return psycopg2.connect(
         host=os.environ["RDS_HOST"],
         port=int(os.environ.get("RDS_PORT", 5432)),
-        database=os.environ["RDS_DB"],
+        database=os.environ["RDS_TRANSACTIONS_DB"],
         user=os.environ["RDS_USER"],
         password=os.environ["RDS_PASSWORD"],
+        sslmode=os.environ.get('RDS_SSLMODE', 'verify-full'),
+        sslrootcert=os.environ.get('RDS_SSLROOTCERT', './global-bundle.pem'),
+        connect_timeout=10,
     )
 
 
