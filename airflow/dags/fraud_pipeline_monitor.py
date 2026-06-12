@@ -11,18 +11,27 @@ Checks:
   4. check_rds_connectivity   → Ping RDS
   5. check_pipeline_lag       → Tính toán lag giữa extracted_time và current time
   6. send_health_report       → Gửi báo cáo tổng hợp
+
+Airflow 3.x compatibility:
+  - days_ago() bị xóa → dùng datetime trực tiếp
+  - schedule_interval= bị xóa → dùng schedule=
+  - execution_date bị xóa → dùng logical_date
+  - Direct DB/ORM access từ worker bị cấm → dùng Airflow REST API v2
+  - provide_session / NEW_SESSION không dùng được trong task worker
+  - airflow_sla_miss_callback bị xóa (SLA feature removed in Airflow 3.x)
 """
 
 import os
 import json
 import logging
+import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
 import psycopg2
 from airflow import DAG
-from airflow.models import Variable, DagRun
+from airflow.models import Variable
 from airflow.providers.standard.operators.python import PythonOperator
 
 import sys
@@ -63,33 +72,44 @@ def check_recent_batches(**context):
     """
     Kiểm tra DAG 'fraud_detection_preprocessing' có chạy thành công
     trong 30 phút qua không.
+
+    Airflow 3.x: Direct DB/ORM access bị cấm trong task worker.
+    → Dùng Airflow REST API v2 thay thế (endpoint /api/v2/dags/{dag_id}/dagRuns).
+    API base URL lấy từ env AIRFLOW_API_BASE_URL, mặc định http://localhost:8080.
     """
-    # FIX Airflow 3.x:
-    #   - create_session bị xóa → dùng NEW_SESSION / provide_session
-    #   - State.SUCCESS → dùng string "success" trực tiếp
-    #   - execution_date → logical_date trong Airflow 3.x
-    from airflow.utils.session import NEW_SESSION, provide_session
-    from sqlalchemy.orm import Session
+    airflow_base = os.environ.get("AIRFLOW_API_BASE_URL", "http://localhost:8080")
+    api_url = f"{airflow_base}/api/v2/dags/fraud_detection_preprocessing/dagRuns"
 
     threshold = datetime.now(tz=timezone.utc) - timedelta(minutes=30)
 
-    from airflow.models.dagrun import DagRun as DR
-    from airflow.utils.db import provide_session as db_session
+    # Airflow REST API v2 auth — dùng username/password (Basic Auth)
+    api_user = os.environ.get("AIRFLOW_API_USER", "admin")
+    api_pass = os.environ.get("AIRFLOW_API_PASS", "")
 
-    @db_session
-    def _query(session: Session = NEW_SESSION):
-        return (
-            session.query(DR)
-            .filter(
-                DR.dag_id == "fraud_detection_preprocessing",
-                DR.logical_date >= threshold,
-            )
-            .order_by(DR.logical_date.desc())
-            .limit(10)
-            .all()
+    try:
+        resp = requests.get(
+            api_url,
+            params={
+                "limit": 10,
+                "order_by": "-logical_date",
+                # Lọc các run sau threshold
+                "logical_date_gte": threshold.isoformat(),
+            },
+            auth=(api_user, api_pass) if api_pass else None,
+            timeout=15,
         )
-
-    recent_runs = _query()
+        resp.raise_for_status()
+        data = resp.json()
+        recent_runs = data.get("dag_runs", [])
+    except Exception as e:
+        logger.error(f"Failed to query Airflow REST API: {e}")
+        send_alert(
+            subject="Monitor: Cannot reach Airflow REST API",
+            message=f"check_recent_batches could not query /api/v2. Error: {e}",
+            level="error",
+        )
+        context["ti"].xcom_push(key="pipeline_status", value="api_error")
+        return
 
     if not recent_runs:
         send_alert(
@@ -101,23 +121,29 @@ def check_recent_batches(**context):
         context["ti"].xcom_push(key="pipeline_status", value="no_runs")
         return
 
-    # FIX Airflow 3.x: dùng string state thay vì State enum
-    success_runs = [r for r in recent_runs if r.state == "success"]
-    failed_runs  = [r for r in recent_runs if r.state == "failed"]
+    # state là string trong Airflow 3.x ("success", "failed", "running", ...)
+    success_runs = [r for r in recent_runs if r.get("state") == "success"]
+    failed_runs  = [r for r in recent_runs if r.get("state") == "failed"]
 
-    logger.info(f"Recent runs: {len(recent_runs)} | success: {len(success_runs)} | failed: {len(failed_runs)}")
+    logger.info(
+        f"Recent runs: {len(recent_runs)} | "
+        f"success: {len(success_runs)} | failed: {len(failed_runs)}"
+    )
 
     if failed_runs and not success_runs:
         send_alert(
             subject=f"Pipeline FAILING — {len(failed_runs)} consecutive failures",
             message=f"Last {len(failed_runs)} runs all failed. Immediate attention required.",
             level="error",
-            context={"failed_count": len(failed_runs), "last_run": str(failed_runs[0].logical_date)}
+            context={
+                "failed_count": len(failed_runs),
+                "last_run": failed_runs[0].get("logical_date", "unknown"),
+            }
         )
     elif failed_runs:
         send_alert(
             subject=f"Pipeline has {len(failed_runs)} recent failures",
-            message=f"Some runs failed but pipeline is still operational.",
+            message="Some runs failed but pipeline is still operational.",
             level="warning",
             context={"failed": len(failed_runs), "success": len(success_runs)}
         )

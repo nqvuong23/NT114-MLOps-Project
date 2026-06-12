@@ -15,6 +15,12 @@ Flow:
   8. call_fraud_api         → Gọi API Gateway → Lambda → ECS Model
   9. save_predictions       → Lưu prediction vào S3 /prediction/
  10. dvc_track              → DVC track tất cả S3 outputs
+
+Airflow 3.x compatibility:
+  - execution_date bị xóa → dùng logical_date
+  - email/email_on_failure trong default_args bị deprecated → xóa
+  - datetime.utcnow() → datetime.now(tz=timezone.utc)
+  - Import DAG từ airflow.sdk thay vì airflow (Airflow 3.x)
 """
 
 import os
@@ -65,8 +71,8 @@ default_args = {
     "retry_exponential_backoff": True,
     "max_retry_delay": timedelta(minutes=10),
     "on_failure_callback": airflow_failure_callback,
-    "email_on_failure": True,
-    "email": [os.environ.get("ALERT_EMAIL", "")],
+    # FIX Airflow 3.x: email_on_failure và email bị deprecated trong default_args
+    # → Dùng SmtpNotifier hoặc on_failure_callback để gửi email thay thế
 }
 
 # ── DAG Definition ────────────────────────────────────────────────────────────
@@ -86,9 +92,9 @@ dag = DAG(
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_batch_id(execution_date) -> str:
-    """Tạo batch_id từ execution_date."""
-    return execution_date.strftime("%Y%m%d_%H%M%S")
+def get_batch_id(logical_date) -> str:
+    """Tạo batch_id từ logical_date (Airflow 3.x — thay thế execution_date)."""
+    return logical_date.strftime("%Y%m%d_%H%M%S")
 
 
 def get_rds_conn():
@@ -188,10 +194,14 @@ def extract_from_rds(**context):
     """
     Task 1: Query batch data từ RDS dựa vào last_processed_timestamp.
     Lưu timestamp mới vào Airflow Variable.
+
+    Airflow 3.x: execution_date bị xóa → dùng logical_date.
+    logical_date trong Airflow 3.x = run_after time (thời điểm DAG run được queue).
     """
-    execution_date = context["execution_date"]
-    batch_id = get_batch_id(execution_date)
-    batch_end = execution_date
+    # FIX Airflow 3.x: execution_date → logical_date
+    logical_date = context["logical_date"]
+    batch_id = get_batch_id(logical_date)
+    batch_end = logical_date
     batch_start = batch_end - timedelta(minutes=5)
 
     # Lấy last timestamp từ Variable (fallback: 5 phút trước)
@@ -533,7 +543,7 @@ def dvc_track(**context):
     # Ghi DVC metadata JSON
     dvc_meta = {
         "batch_id": batch_id,
-        "tracked_at": datetime.utcnow().isoformat(),
+        "tracked_at": datetime.now(tz=timezone.utc).isoformat(),
         "paths": paths_to_track,
         "row_count": ti.xcom_pull(key="row_count", task_ids="extract_from_rds"),
     }
