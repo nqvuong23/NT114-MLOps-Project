@@ -29,7 +29,7 @@ conn = psycopg2.connect(
     connect_timeout=10,
 )
 with conn.cursor() as cur:
-    cur.execute("SELECT COUNT(*), SUM(is_fraud_label) FROM transactions")
+    cur.execute("SELECT COUNT(*), SUM(is_fraud_label) FROM transactions;")
     total, frauds = cur.fetchone()
     print(f"Total: {total} | Frauds: {frauds} ({frauds/total*100:.3f}%)")
 conn.close()

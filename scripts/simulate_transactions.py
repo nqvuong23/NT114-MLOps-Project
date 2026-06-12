@@ -166,6 +166,8 @@ def setup_table(conn):
         ON transactions (timestamp);
     CREATE INDEX IF NOT EXISTS idx_transactions_created_at
         ON transactions (created_at);
+    CREATE INDEX IF NOT EXISTS idx_transactions_card_id 
+        ON transactions (card_id);
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
@@ -224,7 +226,7 @@ if __name__ == "__main__":
                         help="Spread transactions over this many seconds (default: 300 = 5min)")
     args = parser.parse_args()
 
-    required_env = ["RDS_HOST", "RDS_DB", "RDS_USER", "RDS_PASSWORD"]
+    required_env = ["RDS_HOST", "RDS_TRANSACTIONS_DB", "RDS_USER", "RDS_PASSWORD"]
     missing = [e for e in required_env if not os.environ.get(e)]
     if missing:
         raise EnvironmentError(f"Missing required env vars: {missing}")
