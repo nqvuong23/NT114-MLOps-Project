@@ -43,9 +43,9 @@ phases:
       - bentoml build
       - echo "Build Docker image từ BentoML..."
       # BentoML tự sinh Dockerfile và build Docker
-      - bento_tag=$(bentoml list -o json | grep -o '"tag":"[^"]*' | head -n 1 | cut -d'"' -f4)
+      - bento_tag=$(bentoml list -o json | python -c 'import sys, json; print(json.load(sys.stdin)[0]["tag"])')
       - echo "Tag của Bento vừa build là $bento_tag"
-      - bentoml containerize $bento_tag --opt platform=linux/amd64 -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
+      - bentoml containerize $bento_tag -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
       
       - echo "Chạy quét lỗ hổng bảo mật bằng Trivy..."
       # Nếu quét thấy lỗi bảo mật HIGH hoặc CRITICAL, CodeBuild sẽ dừng tại đây và báo thất bại
