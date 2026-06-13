@@ -4,7 +4,7 @@ phases:
   install:
     commands:
       - echo "Đang chuẩn bị môi trường..."
-      - pip install mlflow boto3 bentoml openpyxl pandas numpy xgboost scikit-learn
+      - pip install mlflow boto3 bentoml openpyxl pandas numpy xgboost scikit-learn psycopg2-binary
       - echo "Cài đặt Trivy..."
       # Sử dụng script kiểm tra hệ điều hành để cài đặt Trivy tương ứng (Ubuntu/Amazon Linux)
       - |
