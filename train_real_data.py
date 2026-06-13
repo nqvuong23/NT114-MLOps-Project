@@ -41,6 +41,28 @@ if "AWS_ACCESS_KEY_ID" not in os.environ:
 
 mlflow.set_experiment("Real_Data_Fraud_Detection")
 
+# Khởi tạo MLflow client
+client = mlflow.tracking.MlflowClient()
+model_name = "CreditCardFraudModel"
+
+# Lấy điểm F1-score của mô hình đang ở stage Production (nếu có)
+production_f1 = 0.0
+try:
+    latest_versions = client.get_latest_versions(model_name, stages=["Production"])
+    if latest_versions:
+        prod_version = latest_versions[0]
+        run_id = prod_version.run_id
+        run = client.get_run(run_id)
+        # Kiểm tra metric f1_score hoặc best_f1_score
+        production_f1 = run.data.metrics.get("f1_score", 0.0)
+        if production_f1 == 0.0:
+            production_f1 = run.data.metrics.get("best_f1_score", 0.0)
+        print(f"Current Production Model Version: {prod_version.version}, F1-score: {production_f1:.4f}")
+    else:
+        print("No active Production model version found.")
+except Exception as e:
+    print(f"Notice: No active Production model found or error querying registry: {e}")
+
 # 2. Đọc dữ liệu từ S3 Feature Store (hoặc local file fallback)
 def load_data():
     bucket = os.environ.get("S3_BUCKET", "nt114-mlops-bucket")
@@ -208,10 +230,28 @@ with mlflow.start_run(run_name="optuna_parent_run") as parent_run:
     print("\nClassification Report:")
     print(classification_report(y_test, preds))
     
-    # Đẩy mô hình lên S3 và đăng ký vào Model Registry
-    mlflow.xgboost.log_model(
-        xgb_model=final_model,
-        artifact_path="model",
-        registered_model_name="CreditCardFraudModel"
-    )
-    print("\n[SUCCESS] Final model logged and registered in MLflow Registry as 'CreditCardFraudModel'!")
+    # Luôn log mô hình vào parent run của MLflow để lưu trữ
+    mlflow.xgboost.log_model(xgb_model=final_model, artifact_path="model")
+    
+    # 7. So sánh và thăng cấp (F1 mới >= F1 cũ + 0.01 hoặc chưa có mô hình chạy thực tế)
+    promotion_threshold = production_f1 + 0.01
+    if final_f1 >= promotion_threshold or production_f1 == 0.0:
+        print(f"\n[PROMOTION] New model F1-score ({final_f1:.4f}) meets the promotion threshold (>= {promotion_threshold:.4f}).")
+        
+        # Đăng ký mô hình vào Registry từ run hiện tại
+        run_uri = f"runs:/{parent_run.info.run_id}/model"
+        model_version = mlflow.register_model(run_uri, model_name)
+        new_version = model_version.version
+        print(f"New model registered as version {new_version} in MLflow Registry.")
+        
+        # Tự động chuyển version mới lên Staging
+        print(f"Transitioning version {new_version} to 'Staging'...")
+        client.transition_model_version_stage(
+            name=model_name,
+            version=new_version,
+            stage="Staging"
+        )
+        print(f"[SUCCESS] Version {new_version} is now in 'Staging' stage and ready for integration tests!")
+    else:
+        print(f"\n[REJECTED] New model F1-score ({final_f1:.4f}) is lower than the promotion threshold (< {promotion_threshold:.4f}).")
+        print("Skipped model registration and promotion.")
