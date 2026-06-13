@@ -234,9 +234,16 @@ def validate_raw(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    raw_json = ti.xcom_pull(key="raw_df_json", task_ids="extract_from_rds")
-    df = pd.read_json(raw_json, orient="records")
 
+    s3 = get_s3_client()
+    import io
+    key = f"{S3_RAW}/{batch_id}/raw.parquet"
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    except Exception as e:
+        raise RuntimeError(f"Cannot read raw data from S3: {e}")
+    
     from ge_validations import validate_raw_data, log_validation_result
     passed, result = validate_raw_data(df)
     log_validation_result(result, "raw_data")
