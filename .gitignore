@@ -64,4 +64,14 @@ __pycache__/
 
 .env
 
+
 dvc_project/
+
+# Model artifacts and config
+model/
+scaler_stats.json
+imagedefinitions.json
+
+# BentoML build files
+.bento/
+*.bento

@@ -1,0 +1,41 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Đang chuẩn bị môi trường..."
+      - pip install mlflow boto3 bentoml openpyxl pandas numpy xgboost scikit-learn
+      # Cài đặt Trivy để quét bảo mật
+      - echo "Cài đặt Trivy..."
+      - wget https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.deb
+      - dpkg -i trivy_0.49.1_Linux-64bit.deb
+  pre_build:
+    commands:
+      - echo "Đăng nhập vào Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo "Tải mô hình Staging từ MLflow..."
+      - python scripts/download_model.py
+  build:
+    commands:
+      - echo "Đóng gói BentoML..."
+      - bentoml build
+      - echo "Build Docker image từ BentoML..."
+      # BentoML tự sinh Dockerfile và build Docker
+      - bento_tag=$(bentoml list -o json | grep -o '"tag":"[^"]*' | head -n 1 | cut -d'"' -f4)
+      - echo "Tag của Bento vừa build là $bento_tag"
+      - bentoml containerize $bento_tag --opt platform=linux/amd64 -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
+      
+      - echo "Chạy quét lỗ hổng bảo mật bằng Trivy..."
+      # Nếu quét thấy lỗi bảo mật HIGH hoặc CRITICAL, CodeBuild sẽ dừng tại đây và báo thất bại
+      - trivy image --severity HIGH,CRITICAL --exit-code 1 $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
+  post_build:
+    commands:
+      - echo "Đẩy Docker image lên Amazon ECR..."
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
+      - echo "Tạo tệp imagedefinitions.json phục vụ CodeDeploy..."
+      # File này báo cho ECS biết container nào sẽ thay thế bằng ECR image mới
+      - printf '[{"name":"bentoml-service","imageUri":"%s"}]' "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest" > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
