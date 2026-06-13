@@ -4,31 +4,145 @@ import xgboost as xgb
 import optuna
 import mlflow
 import mlflow.xgboost
-from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from sklearn.metrics import f1_score, classification_report
 import os
+import io
+import boto3
 
-# 1. Cấu hình kết nối tới MLflow và MinIO S3 Mock
-mlflow.set_tracking_uri("http://localhost:5000")
-os.environ["AWS_ACCESS_KEY_ID"] = "minio_admin"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "minio_password"
-os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://localhost:9000"
-os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
+# Hàm đọc tệp .env thủ công để nạp các cấu hình AWS/RDS
+def load_env_file():
+    if os.path.exists(".env"):
+        print("Loading environment variables from .env...")
+        with open(".env", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    os.environ[key] = val
+
+load_env_file()
+
+# 1. Cấu hình kết nối tới MLflow và S3
+tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
+mlflow.set_tracking_uri(tracking_uri)
+print(f"MLflow Tracking URI: {tracking_uri}")
+
+# Thiết lập AWS credentials từ .env hoặc môi trường
+if "AWS_ACCESS_KEY_ID" not in os.environ:
+    # Fallback về MinIO local nếu không có trong env
+    os.environ["AWS_ACCESS_KEY_ID"] = "minio_admin"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "minio_password"
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://localhost:9000"
+    os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
 
 mlflow.set_experiment("Real_Data_Fraud_Detection")
 
-# 2. Đọc dữ liệu thật từ file CSV
-print("Loading real dataset (creditcard.csv)...")
-df = pd.read_csv("creditcard.csv")
-print(f"Dataset loaded. Total shape: {df.shape}")
+# 2. Đọc dữ liệu từ S3 Feature Store (hoặc local file fallback)
+def load_data():
+    bucket = os.environ.get("S3_BUCKET", "nt114-mlops-bucket")
+    endpoint_url = os.environ.get("MLFLOW_S3_ENDPOINT_URL")
+    
+    # Khởi tạo boto3 client
+    s3_client = boto3.client(
+        "s3",
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1"),
+        endpoint_url=endpoint_url if endpoint_url else None
+    )
+    
+    possible_keys = ["feature-store/creditcard.csv", "feature-store/credit.csv"]
+    df = None
+    
+    for key in possible_keys:
+        try:
+            print(f"Attempting to download s3://{bucket}/{key}...")
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            print(f"Successfully connected to S3. Loading CSV data...")
+            df = pd.read_csv(io.BytesIO(response['Body'].read()))
+            print(f"Data loaded from S3. Shape: {df.shape}")
+            break
+        except Exception as e:
+            print(f"Could not load from s3://{bucket}/{key}: {e}")
+            
+    if df is None:
+        local_file = "creditcard.csv"
+        if os.path.exists(local_file):
+            print(f"Falling back to local file: {local_file}")
+            df = pd.read_csv(local_file)
+            print(f"Data loaded from local file. Shape: {df.shape}")
+        else:
+            raise FileNotFoundError("Could not find data on S3 or locally.")
+            
+    return df
 
-# 3. Phân tách Train / Test theo thời gian (cột Time)
-# Sắp xếp theo Time trước để đảm bảo tính tuần tự
-df = df.sort_values(by="Time").reset_index(drop=True)
+df = load_data()
 
-X = df.drop(columns=["Class"])
-y = df["Class"]
+# 3. Tiền xử lý đặc trưng (Feature Engineering)
+def prepare_features(df_input):
+    df_processed = df_input.copy()
+    
+    # Kiểm tra xem đây là dữ liệu thô (raw) hay đã qua feature store xử lý sẵn
+    if "Class" in df_processed.columns and "is_fraud_label" not in df_processed.columns:
+        print("Raw dataset detected. Applying feature engineering matching Spark jobs...")
+        
+        # 1. is_fraud_label
+        df_processed["is_fraud_label"] = df_processed["Class"]
+        
+        # 2. hour_of_day
+        df_processed["hour_of_day"] = (df_processed["Time"] // 3600) % 24
+        
+        # 3. is_night_hour: [22, 23, 0, 1, 2, 3, 4]
+        df_processed["is_night_hour"] = df_processed["hour_of_day"].isin([22, 23, 0, 1, 2, 3, 4]).astype(int)
+        
+        # 4. amount_log1p
+        df_processed["amount_log1p"] = np.log1p(df_processed["Amount"])
+        
+        # 5. amount_normalized
+        amount_mean = df_processed["Amount"].mean()
+        amount_std = df_processed["Amount"].std()
+        df_processed["amount_normalized"] = (df_processed["Amount"] - amount_mean) / (amount_std if amount_std > 0 else 1.0)
+        
+        # 6. amount_zscore
+        df_processed["amount_zscore"] = df_processed["amount_normalized"]
+        
+        # 7. tx_count_1h
+        times = df_processed["Time"].values
+        start_indices = np.searchsorted(times, times - 3600, side="left")
+        df_processed["tx_count_1h"] = (np.arange(len(times)) - start_indices + 1).astype(int)
+        
+        # 8. is_high_amount
+        df_processed["is_high_amount"] = (df_processed["Amount"] > 500).astype(int)
+        
+        # 9. is_international
+        df_processed["is_international"] = 0
+        
+        # 10. amount
+        df_processed["amount"] = df_processed["Amount"]
+        
+    # Đảm bảo sắp xếp cột đúng thứ tự các đặc trưng dùng để huấn luyện
+    feature_cols = (
+        ["amount", "amount_normalized", "amount_log1p", "amount_zscore",
+         "tx_count_1h", "is_night_hour", "is_high_amount",
+         "is_international", "hour_of_day"]
+        + [f"V{i}" for i in range(1, 29)]
+    )
+    
+    # Sắp xếp lại theo Time để chia Train/Test theo thời gian một cách tuần tự
+    if "Time" in df_processed.columns:
+        df_processed = df_processed.sort_values(by="Time").reset_index(drop=True)
+    elif "timestamp" in df_processed.columns:
+        df_processed = df_processed.sort_values(by="timestamp").reset_index(drop=True)
+        
+    X_processed = df_processed[feature_cols]
+    y_processed = df_processed["is_fraud_label"]
+    return X_processed, y_processed
 
-# Tính mốc thời gian để cắt 80% dữ liệu đầu cho Train, 20% sau cho Test
+X, y = prepare_features(df)
+
+# Phân tách Train / Test theo tỷ lệ 80/20
 split_idx = int(len(df) * 0.8)
 X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
 y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
@@ -39,7 +153,7 @@ print(f"Test set: {X_test.shape[0]} samples (Fraud: {y_test.sum()})")
 # Tính toán tỷ lệ mất cân bằng để làm baseline cho scale_pos_weight
 num_neg = (y_train == 0).sum()
 num_pos = (y_train == 1).sum()
-base_scale_weight = num_neg / num_pos
+base_scale_weight = num_neg / num_pos if num_pos > 0 else 1.0
 print(f"Imbalance ratio in Train set: {num_neg} neg / {num_pos} pos = {base_scale_weight:.2f}")
 
 # 4. Định nghĩa hàm tối ưu hóa Optuna
@@ -50,7 +164,6 @@ def objective(trial):
         "max_depth": trial.suggest_int("max_depth", 3, 9),
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
         "n_estimators": trial.suggest_int("n_estimators", 50, 150),
-        # Optuna sẽ tự điều chỉnh scale_pos_weight quanh tỷ lệ mất cân bằng cơ sở
         "scale_pos_weight": trial.suggest_float("scale_pos_weight", base_scale_weight * 0.5, base_scale_weight * 1.5),
         "random_state": 42
     }
