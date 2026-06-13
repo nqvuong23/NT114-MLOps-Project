@@ -31,11 +31,7 @@ V_COLS = [f"V{i}" for i in range(1, 29)]
 
 # ── Helper: tạo ephemeral GE context (không cần file trên disk) ──────────────
 def _get_ge_context():
-    config = DataContextConfig(
-        store_backend_defaults=InMemoryStoreBackendDefaults(),
-        anonymous_usage_statistics={"enabled": False},
-    )
-    return gx.get_context(project_config=config)
+    return gx.get_context(mode="ephemeral")
 
 
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
