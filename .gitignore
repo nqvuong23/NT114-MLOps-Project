@@ -48,6 +48,7 @@ airflow/config/*
 
 # Python virtual environment
 venv/
+.venv/
 
 # Large datasets
 *.csv
@@ -62,3 +63,5 @@ __pycache__/
 *.pem
 
 .env
+
+dvc_project/

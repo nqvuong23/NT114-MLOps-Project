@@ -186,13 +186,10 @@ else
 fi
 
 # Cài Apache Airflow và MLflow và Spark
-echo "[+] Setting Spark Notebooks directory permissions..."
-mkdir -p "${PROJECT_ROOT}/spark/spark_notebooks"
-sudo chmod -R 777 "${PROJECT_ROOT}/spark/spark_notebooks"
 echo "[+] Setting Airflow directory permissions..."
 sudo mkdir -p "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
 sudo chown -R 50000:0 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
-sudo chmod -R 775 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
+sudo chmod -R 777 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
 
 echo "[+] Starting Airflow + MLflow via docker compose..."
 docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true

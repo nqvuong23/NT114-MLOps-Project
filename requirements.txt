@@ -3,9 +3,6 @@ optuna
 mlflow
 psycopg2-binary
 boto3
-botocore
-scikit-learn 
 numpy
 pandas 
 pyarrow 
-great-expectations
