@@ -299,6 +299,9 @@ services:
   mlflow:
     image: ghcr.io/mlflow/mlflow:${MLFLOW_VERSION}
     container_name: mlflow-server
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       # Backend store URI built from vars
       MLFLOW_BACKEND_STORE_URI: ${MLFLOW_BACKEND_STORE_URI}
