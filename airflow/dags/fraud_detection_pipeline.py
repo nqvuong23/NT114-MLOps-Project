@@ -222,7 +222,7 @@ def extract_from_rds(**context):
                 is_fraud_label
             FROM transactions
             WHERE timestamp > %s AND timestamp <= %s
-            ORDER BY timestamp ASC
+            ORDER BY timestamp ASC;
         """
         df = pd.read_sql_query(query, conn, params=[last_ts, batch_end.isoformat()])
     finally:

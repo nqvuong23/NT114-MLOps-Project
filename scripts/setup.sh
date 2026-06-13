@@ -105,6 +105,7 @@ else
         -p 8888:8888 \
         -p 4040:4040 \
         -v ~/spark_notebooks:/home/jovyan/work \
+        -v "${PROJECT_ROOT}/spark/jobs":/opt/spark_jobs/jobs \
         jupyter/pyspark-notebook
     echo "[✓] Spark container started"
 fi

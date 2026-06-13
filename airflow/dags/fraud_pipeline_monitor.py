@@ -254,7 +254,7 @@ def check_rds_connectivity(**context):
             connect_timeout=10,
         )
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM transactions WHERE created_at > NOW() - INTERVAL '30 minutes'")
+            cur.execute("SELECT COUNT(*) FROM transactions WHERE created_at > NOW() - INTERVAL '30 minutes';")
             recent_count = cur.fetchone()[0]
         conn.close()
         logger.info(f"RDS OK — {recent_count} transactions in last 30 min")
