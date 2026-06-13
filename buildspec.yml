@@ -5,10 +5,12 @@ phases:
     commands:
       - echo "Đang chuẩn bị môi trường..."
       - pip install mlflow boto3 bentoml openpyxl pandas numpy xgboost scikit-learn
-      # Cài đặt Trivy để quét bảo mật
+      # Cài đặt Trivy để quét bảo mật qua Repository chính thức
       - echo "Cài đặt Trivy..."
-      - wget https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.deb
-      - dpkg -i trivy_0.49.1_Linux-64bit.deb
+      - apt-get update && apt-get install -y wget apt-transport-https gnupg lsb-release
+      - wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | tee /usr/share/keyrings/trivy.gpg > /dev/null
+      - echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | tee -a /etc/apt/sources.list.d/trivy.list
+      - apt-get update && apt-get install -y trivy
   pre_build:
     commands:
       - echo "Đăng nhập vào Amazon ECR..."
