@@ -2,12 +2,11 @@
 ge_validations.py
 =================
 Great Expectations validation suites cho 3 giai đoạn:
-  1. raw_data_suite       — kiểm tra data thô từ RDS
+  1. raw_data_suite      — kiểm tra data thô từ RDS
   2. processed_data_suite — kiểm tra sau cleaning & transformation
-  3. feature_suite        — kiểm tra sau feature engineering
+  3. feature_suite       — kiểm tra sau feature engineering
 
 Mỗi suite trả về (passed: bool, results: dict)
-Tương thích với Great Expectations v1.x+ và Python 3.13
 """
 
 import os
@@ -18,86 +17,68 @@ from typing import Tuple
 
 import pandas as pd
 import great_expectations as gx
-import great_expectations.expectations as gxe
+from great_expectations.core.batch import RuntimeBatchRequest
+from great_expectations.data_context import EphemeralDataContext
+from great_expectations.data_context.types.base import (
+    DataContextConfig,
+    InMemoryStoreBackendDefaults,
+)
 
 logger = logging.getLogger(__name__)
 
 # Tên 28 PCA columns
 V_COLS = [f"V{i}" for i in range(1, 29)]
 
-
-# ── Lớp Proxy: Dịch cú pháp Imperative cũ sang Object-Oriented mới của GX 1.x ──
-class GxValidatorProxy:
-    """Giúp giữ nguyên logic viết code cũ của người dùng mà không làm crash hệ thống v1.x"""
-    def __init__(self, suite):
-        self.suite = suite
-
-    def expect_column_to_exist(self, column):
-        self.suite.add_expectation(gxe.ExpectColumnToExist(column=column))
-
-    def expect_column_values_to_not_be_null(self, column):
-        self.suite.add_expectation(gxe.ExpectColumnValuesToNotBeNull(column=column))
-
-    def expect_column_values_to_be_unique(self, column):
-        self.suite.add_expectation(gxe.ExpectColumnValuesToBeUnique(column=column))
-
-    def expect_column_values_to_be_between(self, column, min_value=None, max_value=None):
-        self.suite.add_expectation(gxe.ExpectColumnValuesToBeBetween(column=column, min_value=min_value, max_value=max_value))
-
-    def expect_column_values_to_be_in_set(self, column, value_set):
-        self.suite.add_expectation(gxe.ExpectColumnValuesToBeInSet(column=column, value_set=value_set))
-
-    def expect_table_row_count_to_be_between(self, min_value=None, max_value=None):
-        self.suite.add_expectation(gxe.ExpectTableRowCountToBeBetween(min_value=min_value, max_value=max_value))
-
-    def expect_column_stdev_to_be_between(self, column, min_value=None, max_value=None):
-        self.suite.add_expectation(gxe.ExpectColumnStdevToBeBetween(column=column, min_value=min_value, max_value=max_value))
-
-
-# ── Helper: tạo ephemeral GE context ──────────────────────────────────────────
+# ── Helper: tạo ephemeral GE context (không cần file trên disk) ──────────────
 def _get_ge_context():
-    return gx.get_context(mode="ephemeral")
+    config = DataContextConfig(
+        store_backend_defaults=InMemoryStoreBackendDefaults(),
+        anonymous_usage_statistics={"enabled": False},
+    )
+    return gx.get_context(project_config=config)
 
 
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
     """
-    Chạy GX validation sử dụng cấu trúc ValidationDefinition của bản 1.x
+    Chạy GE checkpoint với ephemeral context.
     Returns: (success, result_dict)
     """
     context = _get_ge_context()
 
-    # 1. Khởi tạo Datasource và Asset theo chuẩn GX 1.x (.data_sources thay vì .sources)
-    datasource = context.data_sources.add_pandas(name=f"ds_{suite_name}")
-    asset = datasource.add_dataframe_asset(name=f"asset_{suite_name}")
-    
-    # Định nghĩa cấu trúc nhận DataFrame động lúc runtime
-    batch_definition = asset.add_batch_definition_whole_dataframe(name=f"batch_def_{suite_name}")
+    # Tạo datasource
+    datasource = context.sources.add_pandas("pandas_source")
+    asset = datasource.add_dataframe_asset(name=suite_name)
+    batch_request = asset.build_batch_request(dataframe=df)
 
-    # 2. Tạo Expectation Suite 
-    suite = context.suites.add(gx.ExpectationSuite(name=suite_name))
-
-    # Chạy hàm nạp expectations qua lớp Proxy bảo vệ
-    proxy_validator = GxValidatorProxy(suite)
-    expectations_fn(proxy_validator)
-
-    # 3. Tạo Validation Definition để gắn Batch dữ liệu với bộ luật Suite
-    validation_definition = context.validation_definitions.add(
-        gx.ValidationDefinition(
-            name=f"val_def_{suite_name}",
-            batch_definition=batch_definition,
-            expectation_suite=suite,
-        )
+    # Tạo expectation suite
+    suite = context.add_or_update_expectation_suite(suite_name)
+    validator = context.get_validator(
+        batch_request=batch_request,
+        expectation_suite=suite,
     )
 
-    # 4. Thực thi kiểm tra trực tiếp bằng cách truyền DataFrame vào parameters
-    validation_result = validation_definition.run(batch_parameters={"dataframe": df})
+    # Thêm expectations
+    expectations_fn(validator)
+    validator.save_expectation_suite(discard_failed_expectations=False)
 
-    success = validation_result.success
+    # Chạy validation
+    checkpoint = context.add_or_update_checkpoint(
+        name=f"{suite_name}_checkpoint",
+        validations=[{
+            "batch_request": batch_request,
+            "expectation_suite_name": suite_name,
+        }],
+    )
+    result = checkpoint.run()
 
-    # Trích xuất danh sách các luật bị fail
+    success = result.success
+    stats = result.run_results
+    first_key = list(stats.keys())[0]
+    validation_result = stats[first_key]["validation_result"]
+
     failed_expectations = [
         {
-            "expectation_type": getattr(r.expectation_config, "type", "Unknown"),
+            "expectation_type": r.expectation_config.expectation_type,
             "column": r.expectation_config.kwargs.get("column", "N/A"),
             "result": str(r.result),
             "success": r.success,
@@ -131,20 +112,31 @@ def validate_raw_data(df: pd.DataFrame) -> Tuple[bool, dict]:
     )
 
     def add_expectations(v):
+        # 1. Tất cả cột bắt buộc phải tồn tại
         for col in required_cols:
             v.expect_column_to_exist(col)
 
+        # 2. Không null ở các cột quan trọng
         for col in ["transaction_id", "user_id", "card_id", "timestamp", "amount", "is_fraud_label"]:
             v.expect_column_values_to_not_be_null(col)
 
+        # 3. transaction_id phải unique
         v.expect_column_values_to_be_unique("transaction_id")
+
+        # 4. amount không âm
         v.expect_column_values_to_be_between("amount", min_value=0)
+
+        # 5. is_fraud_label chỉ nhận 0 hoặc 1
         v.expect_column_values_to_be_in_set("is_fraud_label", [0, 1])
+
+        # 6. hour_of_day trong [0, 23]
         v.expect_column_values_to_be_between("hour_of_day", min_value=0, max_value=23)
 
+        # 7. V1..V28 phải là số (không null — có thể miss vài giá trị)
         for col in V_COLS:
             v.expect_column_values_to_not_be_null(col)
 
+        # 8. Row count > 0
         v.expect_table_row_count_to_be_between(min_value=1)
 
     logger.info(f"Running raw_data validation on {len(df)} rows...")
@@ -158,20 +150,28 @@ def validate_processed_data(df: pd.DataFrame) -> Tuple[bool, dict]:
     Kiểm tra: không còn null, types đúng, giá trị hợp lệ.
     """
     def add_expectations(v):
+        # 1. Không còn null trong bất kỳ cột nào
         for col in df.columns:
             v.expect_column_values_to_not_be_null(col)
 
+        # 2. amount sau chuẩn hóa trong range hợp lý
         v.expect_column_values_to_be_between("amount", min_value=0, max_value=50000)
 
+        # 3. amount_normalized (StandardScaler) phải trong [-10, 10]
         if "amount_normalized" in df.columns:
             v.expect_column_values_to_be_between("amount_normalized", min_value=-10, max_value=10)
 
+        # 4. is_fraud_label vẫn chỉ 0 hoặc 1
         v.expect_column_values_to_be_in_set("is_fraud_label", [0, 1])
+
+        # 5. Không duplicate transaction_id
         v.expect_column_values_to_be_unique("transaction_id")
 
+        # 6. V1..V28 vẫn trong range thực tế [-30, 30] (từ Kaggle stats)
         for col in V_COLS:
             v.expect_column_values_to_be_between(col, min_value=-50, max_value=50)
 
+        # 7. merchant_category không có giá trị lạ
         valid_categories = [
             "grocery", "online", "travel", "restaurant", "entertainment",
             "gas_station", "pharmacy", "electronics", "clothing", "atm", "other"
@@ -189,26 +189,35 @@ def validate_features(df: pd.DataFrame) -> Tuple[bool, dict]:
     Kiểm tra: không NaN, không constant feature, distribution hợp lý.
     """
     def add_expectations(v):
+        # 1. Không null trong toàn bộ
         for col in df.columns:
             v.expect_column_values_to_not_be_null(col)
 
+        # 2. amount_zscore: z-score không quá extreme (fraud detection: [-20, 20])
         if "amount_zscore" in df.columns:
             v.expect_column_values_to_be_between("amount_zscore", min_value=-20, max_value=20)
 
+        # 3. tx_count_1h: số giao dịch trong 1h phải >= 0 và thực tế < 1000
         if "tx_count_1h" in df.columns:
             v.expect_column_values_to_be_between("tx_count_1h", min_value=0, max_value=1000)
 
+        # 4. is_night_hour chỉ 0 hoặc 1
         if "is_night_hour" in df.columns:
             v.expect_column_values_to_be_in_set("is_night_hour", [0, 1])
 
+        # 5. is_international chỉ 0 hoặc 1 (đã convert từ bool)
         v.expect_column_values_to_be_in_set("is_international", [0, 1])
 
+        # 6. Kiểm tra không có constant column (std > 0 cho numeric cols)
         numeric_cols = ["amount", "amount_zscore"] + V_COLS
         for col in numeric_cols:
             if col in df.columns:
                 v.expect_column_stdev_to_be_between(col, min_value=0.0001)
 
+        # 7. is_fraud_label vẫn nhị phân
         v.expect_column_values_to_be_in_set("is_fraud_label", [0, 1])
+
+        # 8. Row count > 0
         v.expect_table_row_count_to_be_between(min_value=1)
 
     logger.info(f"Running feature validation on {len(df)} rows...")
@@ -219,11 +228,13 @@ def log_validation_result(result: dict, step: str):
     """Log kết quả validation ra console/CloudWatch."""
     if result["passed"]:
         logger.info(
-            f"✅ [{step}] Validation PASSED | Total: {result['total_expectations']} expectations"
+            f"✅ [{step}] Validation PASSED | "
+            f"Total: {result['total_expectations']} expectations"
         )
     else:
         logger.error(
-            f"❌ [{step}] Validation FAILED | Failed: {result['failed_count']}/{result['total_expectations']}"
+            f"❌ [{step}] Validation FAILED | "
+            f"Failed: {result['failed_count']}/{result['total_expectations']}"
         )
         for fail in result["failed_expectations"]:
             logger.error(

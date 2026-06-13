@@ -199,7 +199,10 @@ def extract_from_rds(**context):
 
     # Lưu raw DataFrame dạng JSON string vào XCom (nếu nhỏ, < 10k rows)
     # Với batch lớn hơn nên dùng temp file, nhưng 5 phút data thường nhỏ
-    context["ti"].xcom_push(key="raw_df_json", value=df.to_json(orient="records"))
+    context["ti"].xcom_push(
+        key="raw_df_json", 
+        value=df.to_json(orient="records", date_format="iso")
+    )
 
     # Cập nhật last timestamp
     Variable.set("fraud_pipeline_last_timestamp", batch_end.isoformat())
@@ -265,6 +268,7 @@ def run_spark_cleaning(**context):
 
     from spark_cleaning import clean_and_transform, get_spark_session
 
+    spark = get_spark_session("FraudDetection-Pipeline")
     try:
         row_count, fraud_count = clean_and_transform(
             input_path=input_path,

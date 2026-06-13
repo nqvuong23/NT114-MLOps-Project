@@ -128,9 +128,19 @@ def clean_and_transform(
         model = pipeline.fit(df)
         df = model.transform(df)
 
+        from pyspark.ml.linalg import DenseVector, SparseVector
+
         @F.udf(DoubleType())
         def extract_first(vec):
-            return float(vec[0]) if vec is not None else 0.0
+            if vec is None:
+                return 0.0
+            if isinstance(vec, (DenseVector, SparseVector)):
+                return float(vec.toArray()[0])
+            try:
+                # Fallback nếu nó biến thành list
+                return float(vec[0])
+            except:
+                return 0.0
 
         df = df.withColumn("amount_normalized", extract_first("amount_scaled_vec"))
         df = df.drop("amount_vec", "amount_scaled_vec")
