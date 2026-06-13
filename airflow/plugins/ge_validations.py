@@ -16,30 +16,69 @@ from datetime import datetime, timezone
 from typing import Tuple
 
 import pandas as pd
-from great_expectations.dataset.pandas_dataset import PandasDataset
+import great_expectations as gx
+from great_expectations.data_context.types.base import DataContextConfig, InMemoryStoreBackendDefaults
+from great_expectations.core.batch import RuntimeBatchRequest
 
 logger = logging.getLogger(__name__)
 
 # Tên 28 PCA columns
 V_COLS = [f"V{i}" for i in range(1, 29)]
 
+def _get_ge_context():
+    """Tạo Context hoàn toàn trên RAM."""
+    config = DataContextConfig(
+        store_backend_defaults=InMemoryStoreBackendDefaults()
+    )
+    return gx.get_context(project_config=config)
+
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
     """
-    Validate trực tiếp trên Pandas DataFrame bằng PandasDataset core.
-    Cách này tuyệt đối an toàn, nhẹ gọn và độc lập hoàn toàn với DataContext.
+    Sử dụng V3 RuntimeDataConnector. Cách này cực kỳ an toàn trên Python 3.13 
+    và không phụ thuộc vào các API cũ đã bị xóa.
     """
-    # 1. Bọc trực tiếp Pandas DataFrame thành class GE PandasDataset
-    ge_df = PandasDataset(df)
+    context = _get_ge_context()
+
+    # 1. Khai báo Datasource dạng Runtime (Nạp data trực tiếp từ RAM)
+    datasource_config = {
+        "name": "pandas_runtime_datasource",
+        "class_name": "Datasource",
+        "execution_engine": {"class_name": "PandasExecutionEngine"},
+        "data_connectors": {
+            "default_runtime_connector": {
+                "class_name": "RuntimeDataConnector",
+                "batch_identifiers": ["batch_id"],
+            }
+        },
+    }
+    context.add_datasource(**datasource_config)
+
+    # 2. Tạo Expectation Suite
+    context.add_or_update_expectation_suite(suite_name)
+
+    # 3. Đóng gói Pandas DataFrame vào Batch Request
+    batch_request = RuntimeBatchRequest(
+        datasource_name="pandas_runtime_datasource",
+        data_connector_name="default_runtime_connector",
+        data_asset_name=suite_name,
+        runtime_parameters={"batch_data": df},
+        batch_identifiers={"batch_id": "runtime_batch"},
+    )
+
+    # 4. Lấy Validator và áp dụng các rules
+    validator = context.get_validator(
+        batch_request=batch_request,
+        expectation_suite_name=suite_name,
+    )
     
-    # 2. Gắn các rules (expectations) vào bộ dữ liệu
-    expectations_fn(ge_df)
+    expectations_fn(validator)
     
-    # 3. Chạy quá trình chấm điểm (validate)
-    validation_result = ge_df.validate()
+    # 5. Chạy validation
+    result = validator.validate()
     
-    success = validation_result.success
+    success = result.success
     
-    # 4. Trích xuất thông tin các rules bị fail để log và alert
+    # 6. Lọc các rules bị fail
     failed_expectations = [
         {
             "expectation_type": r.expectation_config.expectation_type,
@@ -47,14 +86,14 @@ def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple
             "result": str(r.result),
             "success": r.success,
         }
-        for r in validation_result.results
+        for r in result.results
         if not r.success
     ]
 
     return success, {
         "suite": suite_name,
         "passed": success,
-        "total_expectations": len(validation_result.results),
+        "total_expectations": len(result.results),
         "failed_count": len(failed_expectations),
         "failed_expectations": failed_expectations,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
