@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Tuple
 
 import pandas as pd
-import great_expectations as gx
+from great_expectations.dataset.pandas_dataset import PandasDataset
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +25,16 @@ V_COLS = [f"V{i}" for i in range(1, 29)]
 
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
     """
-    Validate trực tiếp trên Pandas DataFrame, không cần DataContext phức tạp.
-    Cách này chống lỗi tương thích môi trường, không sinh ra file rác và chạy rất nhanh.
+    Validate trực tiếp trên Pandas DataFrame bằng PandasDataset core.
+    Cách này tuyệt đối an toàn, nhẹ gọn và độc lập hoàn toàn với DataContext.
     """
-    # 1. Bọc trực tiếp Pandas DataFrame thành GE PandasDataset
-    ge_df = gx.from_pandas(df)
+    # 1. Bọc trực tiếp Pandas DataFrame thành class GE PandasDataset
+    ge_df = PandasDataset(df)
     
-    # 2. Gắn các rules (expectations) vào bộ dữ liệu. 
-    # GE PandasDataset hỗ trợ sẵn tất cả các hàm expect_column_... y hệt như Validator.
+    # 2. Gắn các rules (expectations) vào bộ dữ liệu
     expectations_fn(ge_df)
     
-    # 3. Chạy quá trình chấm điểm (validate) toàn bộ rules
+    # 3. Chạy quá trình chấm điểm (validate)
     validation_result = ge_df.validate()
     
     success = validation_result.success
