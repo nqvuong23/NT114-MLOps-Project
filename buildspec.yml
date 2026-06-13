@@ -31,12 +31,14 @@ phases:
         fi
   pre_build:
     commands:
-      - echo "Đăng nhập vào Amazon ECR..."
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - echo "Đăng nhập vào Amazon ECR cho tài khoản $AWS_ACCOUNT_ID..."
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - echo "Tải mô hình Staging từ MLflow..."
       - python scripts/download_model.py
   build:
     commands:
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - echo "Đóng gói BentoML..."
       - bentoml build
       - echo "Build Docker image từ BentoML..."
@@ -50,6 +52,7 @@ phases:
       - trivy image --severity HIGH,CRITICAL --exit-code 1 $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
   post_build:
     commands:
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - echo "Đẩy Docker image lên Amazon ECR..."
       - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/nt114-mlops-repo:latest
       - echo "Tạo tệp imagedefinitions.json phục vụ CodeDeploy..."
