@@ -233,6 +233,20 @@ with mlflow.start_run(run_name="optuna_parent_run") as parent_run:
     # Luôn log mô hình vào parent run của MLflow để lưu trữ
     mlflow.xgboost.log_model(xgb_model=final_model, artifact_path="model")
     
+    # Tính toán và lưu thông số chuẩn hóa Amount để phục vụ cho serving
+    amount_mean = df["Amount"].mean()
+    amount_std = df["Amount"].std()
+    scaler_stats = {
+        "amount_mean": float(amount_mean),
+        "amount_std": float(amount_std if amount_std > 0 else 1.0)
+    }
+    import json
+    with open("scaler_stats.json", "w") as f:
+        json.dump(scaler_stats, f)
+        
+    mlflow.log_artifact("scaler_stats.json", artifact_path="model")
+    print(f"Logged scaler_stats.json to MLflow (mean: {amount_mean:.4f}, std: {amount_std:.4f})")
+    
     # 7. So sánh và thăng cấp (F1 mới >= F1 cũ + 0.01 hoặc chưa có mô hình chạy thực tế)
     promotion_threshold = production_f1 + 0.01
     if final_f1 >= promotion_threshold or production_f1 == 0.0:
