@@ -6,3 +6,4 @@ requests
 pyarrow
 great-expectations
 slack-sdk
+pyspark 

@@ -42,7 +42,6 @@ from airflow.providers.standard.operators.python import PythonOperator
 # Import từ plugins
 import sys
 sys.path.insert(0, "/opt/airflow/plugins")
-sys.path.insert(0, "/opt/great_expectations")
 
 from alert_utils import send_alert, airflow_failure_callback
 
@@ -55,12 +54,14 @@ S3_PROCESSED     = os.environ.get("S3_PROCESSED_PREFIX", "processed-data")
 S3_FEATURE       = os.environ.get("S3_FEATURE_PREFIX", "feature-store")
 S3_PREDICTION    = os.environ.get("S3_PREDICTION_PREFIX", "prediction")
 S3_DEAD_LETTER   = os.environ.get("S3_DEAD_LETTER_PREFIX", "dead-letter")
-SPARK_HOME       = os.environ.get("SPARK_HOME", "/opt/spark")
-SPARK_JOBS_DIR   = "/opt/spark_jobs/jobs"
+SPARK_JOBS_DIR   = "/opt/spark/jobs"
 API_GATEWAY_URL  = os.environ.get("API_GATEWAY_URL", "")
 API_USERNAME     = os.environ.get("API_GATEWAY_USERNAME", "admin")
 API_PASSWORD     = os.environ.get("API_GATEWAY_PASSWORD", "")
 AWS_REGION       = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
+
+if SPARK_JOBS_DIR not in sys.path:
+    sys.path.insert(0, SPARK_JOBS_DIR)
 
 # ── Default Args ─────────────────────────────────────────────────────────────
 default_args = {
@@ -138,53 +139,6 @@ def write_dead_letter(df: pd.DataFrame, batch_id: str, step: str, reason: str):
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buffer.getvalue())
     s3.put_object(Bucket=S3_BUCKET, Key=reason_key, Body=reason.encode())
     logger.warning(f"Dead letter written: s3://{S3_BUCKET}/{key}")
-
-
-def run_spark_job(script: str, args: list) -> dict:
-    """
-    Submit Spark job local và capture output JSON.
-    Implements exponential backoff retry.
-    """
-    spark_submit = os.path.join(SPARK_HOME, "bin", "spark-submit")
-    cmd = [spark_submit, "--master", "local[*]", script] + args
-
-    max_retries = 3
-    base_wait = 30  # seconds
-
-    for attempt in range(1, max_retries + 1):
-        logger.info(f"Spark submit attempt {attempt}/{max_retries}: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=1800,  # 30 min timeout
-                env={**os.environ, "PYSPARK_PYTHON": sys.executable},
-            )
-            if result.returncode == 0:
-                # Parse JSON output từ stdout (script in json ở cuối)
-                for line in reversed(result.stdout.strip().split("\n")):
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                return {"status": "success", "stdout": result.stdout}
-            else:
-                error_msg = result.stderr[-2000:] if result.stderr else "No stderr"
-                logger.error(f"Spark attempt {attempt} failed:\n{error_msg}")
-                if attempt < max_retries:
-                    wait = base_wait * (2 ** (attempt - 1))
-                    logger.info(f"Retrying in {wait}s...")
-                    import time
-                    time.sleep(wait)
-        except subprocess.TimeoutExpired:
-            logger.error(f"Spark job timeout on attempt {attempt}")
-            if attempt < max_retries:
-                import time
-                time.sleep(base_wait * attempt)
-
-    raise RuntimeError(f"Spark job failed after {max_retries} attempts")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TASK FUNCTIONS
@@ -302,18 +256,35 @@ def run_spark_cleaning(**context):
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
         return
-
+    
+    import json
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    script = os.path.join(SPARK_JOBS_DIR, "spark_cleaning.py")
 
-    result = run_spark_job(script, [
-        "--batch-id", batch_id,
-        "--bucket", S3_BUCKET,
-        "--raw-prefix", S3_RAW,
-        "--processed-prefix", S3_PROCESSED,
-    ])
-    logger.info(f"Spark cleaning result: {result}")
-    ti.xcom_push(key="cleaning_result", value=json.dumps(result))
+    input_path  = f"s3a://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet"
+    output_path = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet"
+
+    from spark_cleaning import clean_and_transform, get_spark_session
+
+    try:
+        row_count, fraud_count = clean_and_transform(
+            input_path=input_path,
+            output_path=output_path,
+            spark=spark,     # truyền session vào để tái sử dụng
+        )
+        result = {
+            "batch_id": batch_id,
+            "output_path": output_path,
+            "row_count": row_count,
+            "fraud_count": fraud_count,
+            "status": "success",
+        }
+        logger.info(f"Spark cleaning result: {result}")
+        ti.xcom_push(key="cleaning_result", value=json.dumps(result))
+        # Lưu spark session id để task sau tái sử dụng (thông qua getOrCreate)
+    except Exception as e:
+        logger.error(f"Spark cleaning failed: {e}", exc_info=True)
+        spark.stop()
+        raise
 
 
 def validate_processed(**context):
@@ -356,17 +327,37 @@ def run_spark_features(**context):
     if skip:
         return
 
+    import json
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    script = os.path.join(SPARK_JOBS_DIR, "spark_feature_engineering.py")
-
-    result = run_spark_job(script, [
-        "--batch-id", batch_id,
-        "--bucket", S3_BUCKET,
-        "--processed-prefix", S3_PROCESSED,
-        "--feature-prefix", S3_FEATURE,
-    ])
-    logger.info(f"Spark feature result: {result}")
-    ti.xcom_push(key="feature_result", value=json.dumps(result))
+ 
+    input_path  = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet"
+    output_path = f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet"
+ 
+    from spark_feature_engineering import feature_engineering, get_spark_session
+ 
+    # getOrCreate sẽ lấy lại session đang chạy nếu còn tồn tại
+    spark = get_spark_session("FraudDetection-Pipeline")
+    try:
+        row_count, fraud_count = feature_engineering(
+            input_path=input_path,
+            output_path=output_path,
+            spark=spark,
+        )
+        result = {
+            "batch_id": batch_id,
+            "output_path": output_path,
+            "row_count": row_count,
+            "fraud_count": fraud_count,
+            "status": "success",
+        }
+        logger.info(f"Spark feature result: {result}")
+        ti.xcom_push(key="feature_result", value=json.dumps(result))
+        # Stop session sau khi cả 2 spark tasks hoàn thành
+        spark.stop()
+    except Exception as e:
+        logger.error(f"Spark feature engineering failed: {e}", exc_info=True)
+        spark.stop()
+        raise
 
 
 def validate_features(**context):

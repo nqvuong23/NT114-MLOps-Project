@@ -88,28 +88,6 @@ else
     echo "[✓] Docker already installed: $(docker --version) — skipping"
 fi
 
-# Cài Apache Spark
-mkdir -p ~/spark_notebooks
-chmod 777 ~/spark_notebooks
-
-if docker ps -a --format '{{.Names}}' | grep -q '^my_spark_lab$'; then
-    echo "[✓] Spark container 'my_spark_lab' already exists — skipping"
-    if ! docker ps --format '{{.Names}}' | grep -q '^my_spark_lab$'; then
-        echo "[+] Starting existing Spark container..."
-        docker start my_spark_lab
-    fi
-else
-    echo "[+] Starting Spark notebook container..."
-    docker run -d \
-        --name my_spark_lab \
-        -p 8888:8888 \
-        -p 4040:4040 \
-        -v ~/spark_notebooks:/home/jovyan/work \
-        -v "${PROJECT_ROOT}/spark/jobs":/opt/spark_jobs/jobs \
-        jupyter/pyspark-notebook
-    echo "[✓] Spark container started"
-fi
-
 # ── Load env ──────────────────────────────────────────────────────────────────
 if [ -f "$PROJECT_ROOT/.env" ]; then
     export $(grep -v '^#' "$PROJECT_ROOT/.env" | xargs)
@@ -207,7 +185,10 @@ else
     echo "    Install: pip install psycopg2-binary"
 fi
 
-# Cài Apache Airflow và MLflow
+# Cài Apache Airflow và MLflow và Spark
+echo "[+] Setting Spark Notebooks directory permissions..."
+mkdir -p "${PROJECT_ROOT}/spark/spark_notebooks"
+sudo chmod -R 777 "${PROJECT_ROOT}/spark/spark_notebooks"
 echo "[+] Setting Airflow directory permissions..."
 sudo mkdir -p "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
 sudo chown -R 50000:0 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
