@@ -8,77 +8,49 @@ Great Expectations validation suites cho 3 giai đoạn:
 
 Mỗi suite trả về (passed: bool, results: dict)
 """
-
 import os
 import logging
-import json
 from datetime import datetime, timezone
 from typing import Tuple
 
 import pandas as pd
 import great_expectations as gx
-from great_expectations.data_context.types.base import DataContextConfig, InMemoryStoreBackendDefaults
-from great_expectations.core.batch import RuntimeBatchRequest
 
 logger = logging.getLogger(__name__)
 
 # Tên 28 PCA columns
 V_COLS = [f"V{i}" for i in range(1, 29)]
 
-def _get_ge_context():
-    """Tạo Context hoàn toàn trên RAM."""
-    config = DataContextConfig(
-        store_backend_defaults=InMemoryStoreBackendDefaults()
-    )
-    return gx.get_context(project_config=config)
-
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
     """
-    Sử dụng V3 RuntimeDataConnector. Cách này cực kỳ an toàn trên Python 3.13 
-    và không phụ thuộc vào các API cũ đã bị xóa.
+    Sử dụng Fluent API (chuẩn 0.18.x) để validate trực tiếp Pandas DataFrame.
     """
-    context = _get_ge_context()
-
-    # 1. Khai báo Datasource dạng Runtime (Nạp data trực tiếp từ RAM)
-    datasource_config = {
-        "name": "pandas_runtime_datasource",
-        "class_name": "Datasource",
-        "execution_engine": {"class_name": "PandasExecutionEngine"},
-        "data_connectors": {
-            "default_runtime_connector": {
-                "class_name": "RuntimeDataConnector",
-                "batch_identifiers": ["batch_id"],
-            }
-        },
-    }
-    context.add_datasource(**datasource_config)
-
-    # 2. Tạo Expectation Suite
-    context.add_or_update_expectation_suite(suite_name)
-
-    # 3. Đóng gói Pandas DataFrame vào Batch Request
-    batch_request = RuntimeBatchRequest(
-        datasource_name="pandas_runtime_datasource",
-        data_connector_name="default_runtime_connector",
-        data_asset_name=suite_name,
-        runtime_parameters={"batch_data": df},
-        batch_identifiers={"batch_id": "runtime_batch"},
-    )
-
-    # 4. Lấy Validator và áp dụng các rules
+    # 1. Khởi tạo Ephemeral context (Chạy hoàn toàn trên RAM)
+    context = gx.get_context(mode="ephemeral")
+    
+    # 2. Sử dụng FLUENT API: context.data_sources (Không phải context.sources)
+    datasource = context.data_sources.add_pandas(name=f"{suite_name}_datasource")
+    data_asset = datasource.add_dataframe_asset(name=f"{suite_name}_asset")
+    
+    # 3. Đưa DataFrame vào Asset để tạo Batch Request
+    batch_request = data_asset.build_batch_request(dataframe=df)
+    
+    # 4. Khởi tạo Suite và Validator
+    context.add_or_update_expectation_suite(expectation_suite_name=suite_name)
     validator = context.get_validator(
         batch_request=batch_request,
         expectation_suite_name=suite_name,
     )
     
+    # 5. Gắn các rules (expectations) vào validator
     expectations_fn(validator)
     
-    # 5. Chạy validation
+    # 6. Chạy quá trình chấm điểm (validate)
     result = validator.validate()
     
     success = result.success
     
-    # 6. Lọc các rules bị fail
+    # 7. Trích xuất thông tin các rules bị fail để log và alert
     failed_expectations = [
         {
             "expectation_type": r.expectation_config.expectation_type,
@@ -98,7 +70,6 @@ def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple
         "failed_expectations": failed_expectations,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }
-
 
 # ── Suite 1: Raw Data Validation ─────────────────────────────────────────────
 def validate_raw_data(df: pd.DataFrame) -> Tuple[bool, dict]:
