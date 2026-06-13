@@ -17,65 +17,30 @@ from typing import Tuple
 
 import pandas as pd
 import great_expectations as gx
-from great_expectations.core.batch import RuntimeBatchRequest
-from great_expectations.data_context import EphemeralDataContext
-from great_expectations.data_context.types.base import (
-    DataContextConfig,
-    InMemoryStoreBackendDefaults,
-)
 
 logger = logging.getLogger(__name__)
 
 # Tên 28 PCA columns
 V_COLS = [f"V{i}" for i in range(1, 29)]
 
-# ── Helper: tạo ephemeral GE context (không cần file trên disk) ──────────────
-def _get_ge_context():
-    config = DataContextConfig(
-        store_backend_defaults=InMemoryStoreBackendDefaults(),
-        anonymous_usage_statistics={"enabled": False},
-    )
-    return gx.get_context(project_config=config)
-
-
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
     """
-    Chạy GE checkpoint với ephemeral context.
-    Returns: (success, result_dict)
+    Validate trực tiếp trên Pandas DataFrame, không cần DataContext phức tạp.
+    Cách này chống lỗi tương thích môi trường, không sinh ra file rác và chạy rất nhanh.
     """
-    context = _get_ge_context()
-
-    # Tạo datasource
-    datasource = context.sources.add_pandas("pandas_source")
-    asset = datasource.add_dataframe_asset(name=suite_name)
-    batch_request = asset.build_batch_request(dataframe=df)
-
-    # Tạo expectation suite
-    suite = context.add_or_update_expectation_suite(suite_name)
-    validator = context.get_validator(
-        batch_request=batch_request,
-        expectation_suite=suite,
-    )
-
-    # Thêm expectations
-    expectations_fn(validator)
-    validator.save_expectation_suite(discard_failed_expectations=False)
-
-    # Chạy validation
-    checkpoint = context.add_or_update_checkpoint(
-        name=f"{suite_name}_checkpoint",
-        validations=[{
-            "batch_request": batch_request,
-            "expectation_suite_name": suite_name,
-        }],
-    )
-    result = checkpoint.run()
-
-    success = result.success
-    stats = result.run_results
-    first_key = list(stats.keys())[0]
-    validation_result = stats[first_key]["validation_result"]
-
+    # 1. Bọc trực tiếp Pandas DataFrame thành GE PandasDataset
+    ge_df = gx.from_pandas(df)
+    
+    # 2. Gắn các rules (expectations) vào bộ dữ liệu. 
+    # GE PandasDataset hỗ trợ sẵn tất cả các hàm expect_column_... y hệt như Validator.
+    expectations_fn(ge_df)
+    
+    # 3. Chạy quá trình chấm điểm (validate) toàn bộ rules
+    validation_result = ge_df.validate()
+    
+    success = validation_result.success
+    
+    # 4. Trích xuất thông tin các rules bị fail để log và alert
     failed_expectations = [
         {
             "expectation_type": r.expectation_config.expectation_type,
