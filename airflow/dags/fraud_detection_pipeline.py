@@ -148,11 +148,7 @@ def extract_from_rds(**context):
     """
     Task 1: Query batch data từ RDS dựa vào last_processed_timestamp.
     Lưu timestamp mới vào Airflow Variable.
-
-    Airflow 3.x: execution_date bị xóa → dùng logical_date.
-    logical_date trong Airflow 3.x = run_after time (thời điểm DAG run được queue).
     """
-    # FIX Airflow 3.x: execution_date → logical_date
     logical_date = context["logical_date"]
     batch_id = get_batch_id(logical_date)
     batch_end = logical_date
@@ -479,91 +475,91 @@ def call_fraud_api(**context):
     logger.info(f"Predictions: {len(all_predictions)} total | fraud detected: {fraud_predicted}")
 
 
-def save_predictions(**context):
-    """Task 9: Lưu predictions vào S3 /prediction/{batch_id}/"""
-    ti = context["ti"]
-    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
-    if skip:
-        return
+# def save_predictions(**context):
+#     """Task 9: Lưu predictions vào S3 /prediction/{batch_id}/"""
+#     ti = context["ti"]
+#     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
+#     if skip:
+#         return
 
-    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    preds_json = ti.xcom_pull(key="predictions_json", task_ids="call_fraud_api")
+#     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+#     preds_json = ti.xcom_pull(key="predictions_json", task_ids="call_fraud_api")
 
-    if not preds_json:
-        logger.warning("No predictions to save")
-        return
+#     if not preds_json:
+#         logger.warning("No predictions to save")
+#         return
 
-    df = pd.read_json(preds_json, orient="records")
-    s3_key = f"{S3_PREDICTION}/{batch_id}/predictions.parquet"
-    s3_path = upload_parquet_to_s3(df, s3_key)
-    ti.xcom_push(key="prediction_s3_path", value=s3_path)
-    logger.info(f"Predictions saved: {s3_path}")
+#     df = pd.read_json(preds_json, orient="records")
+#     s3_key = f"{S3_PREDICTION}/{batch_id}/predictions.parquet"
+#     s3_path = upload_parquet_to_s3(df, s3_key)
+#     ti.xcom_push(key="prediction_s3_path", value=s3_path)
+#     logger.info(f"Predictions saved: {s3_path}")
 
 
-def dvc_track(**context):
-    """
-    Task 10: DVC track tất cả S3 outputs của batch này.
-    - Chạy dvc add cho từng file trên S3
-    - Commit .dvc files vào Git
-    """
-    ti = context["ti"]
-    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
-    if skip:
-        return
+# def dvc_track(**context):
+#     """
+#     Task 10: DVC track tất cả S3 outputs của batch này.
+#     - Chạy dvc add cho từng file trên S3
+#     - Commit .dvc files vào Git
+#     """
+#     ti = context["ti"]
+#     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
+#     if skip:
+#         return
 
-    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+#     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
-    # Các paths cần DVC track
-    paths_to_track = [
-        f"s3://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet",
-        f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet",
-        f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet",
-        f"s3://{S3_BUCKET}/{S3_PREDICTION}/{batch_id}/predictions.parquet",
-    ]
+#     # Các paths cần DVC track
+#     paths_to_track = [
+#         f"s3://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet",
+#         f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet",
+#         f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet",
+#         f"s3://{S3_BUCKET}/{S3_PREDICTION}/{batch_id}/predictions.parquet",
+#     ]
 
-    dvc_project_dir = "/opt/airflow/dvc_project"
-    os.makedirs(dvc_project_dir, exist_ok=True)
+#     dvc_project_dir = "/opt/airflow/dvc_project"
+#     os.makedirs(dvc_project_dir, exist_ok=True)
 
-    for s3_path in paths_to_track:
-        try:
-            # Dùng DVC import-url để track S3 object
-            cmd = ["dvc", "import-url", "--no-download", s3_path]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=dvc_project_dir,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                logger.info(f"DVC tracked: {s3_path}")
-            else:
-                logger.warning(f"DVC track warning for {s3_path}: {result.stderr}")
-        except Exception as e:
-            logger.warning(f"DVC track failed for {s3_path}: {e} (non-blocking)")
+#     for s3_path in paths_to_track:
+#         try:
+#             # Dùng DVC import-url để track S3 object
+#             cmd = ["dvc", "import-url", "--no-download", s3_path]
+#             result = subprocess.run(
+#                 cmd,
+#                 capture_output=True,
+#                 text=True,
+#                 cwd=dvc_project_dir,
+#                 timeout=60,
+#             )
+#             if result.returncode == 0:
+#                 logger.info(f"DVC tracked: {s3_path}")
+#             else:
+#                 logger.warning(f"DVC track warning for {s3_path}: {result.stderr}")
+#         except Exception as e:
+#             logger.warning(f"DVC track failed for {s3_path}: {e} (non-blocking)")
 
-    # Ghi DVC metadata JSON
-    dvc_meta = {
-        "batch_id": batch_id,
-        "tracked_at": datetime.now(tz=timezone.utc).isoformat(),
-        "paths": paths_to_track,
-        "row_count": ti.xcom_pull(key="row_count", task_ids="extract_from_rds"),
-    }
-    meta_key = f"dvc-metadata/{batch_id}/meta.json"
-    s3 = get_s3_client()
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=meta_key,
-        Body=json.dumps(dvc_meta, indent=2).encode()
-    )
-    logger.info(f"DVC metadata saved: s3://{S3_BUCKET}/{meta_key}")
+#     # Ghi DVC metadata JSON
+#     dvc_meta = {
+#         "batch_id": batch_id,
+#         "tracked_at": datetime.now(tz=timezone.utc).isoformat(),
+#         "paths": paths_to_track,
+#         "row_count": ti.xcom_pull(key="row_count", task_ids="extract_from_rds"),
+#     }
+#     meta_key = f"dvc-metadata/{batch_id}/meta.json"
+#     s3 = get_s3_client()
+#     s3.put_object(
+#         Bucket=S3_BUCKET,
+#         Key=meta_key,
+#         Body=json.dumps(dvc_meta, indent=2).encode()
+#     )
+#     logger.info(f"DVC metadata saved: s3://{S3_BUCKET}/{meta_key}")
 
-    send_alert(
-        subject=f"Pipeline Completed — batch {batch_id}",
-        message=f"All steps completed successfully.\nBatch: {batch_id}",
-        level="success",
-        context={"batch_id": batch_id, "paths": str(len(paths_to_track))}
-    )
+#     send_alert(
+#         subject=f"Pipeline Completed — batch {batch_id}",
+#         message=f"All steps completed successfully.\nBatch: {batch_id}",
+#         level="success",
+#         context={"batch_id": batch_id, "paths": str(len(paths_to_track))}
+#     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -614,15 +610,15 @@ with dag:
         execution_timeout=timedelta(minutes=10),
     )
 
-    t9_save_preds = PythonOperator(
-        task_id="save_predictions",
-        python_callable=save_predictions,
-    )
+    # t9_save_preds = PythonOperator(
+    #     task_id="save_predictions",
+    #     python_callable=save_predictions,
+    # )
 
-    t10_dvc = PythonOperator(
-        task_id="dvc_track",
-        python_callable=dvc_track,
-    )
+    # t10_dvc = PythonOperator(
+    #     task_id="dvc_track",
+    #     python_callable=dvc_track,
+    # )
 
     # ── Pipeline Flow ─────────────────────────────────────────────────────
     (
@@ -634,6 +630,4 @@ with dag:
         >> t6_spark_features
         >> t7_validate_features
         >> t8_call_api
-        >> t9_save_preds
-        >> t10_dvc
     )
