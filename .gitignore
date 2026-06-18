@@ -75,3 +75,5 @@ imagedefinitions.json
 # BentoML build files
 .bento/
 *.bento
+
+testing/

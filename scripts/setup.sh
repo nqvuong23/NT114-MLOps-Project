@@ -14,12 +14,12 @@ VENV_DIR="${PROJECT_ROOT}/.venv"
 
 # Tải các package cần thiết
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip unzip ca-certificates curl tar
+sudo apt install -y python3.12 python3.12-venv python3-pip ca-certificates curl
 
 # ── Tạo và kích hoạt Virtual Environment ─────────────────────────────────────
 if [ ! -d "$VENV_DIR" ]; then
     echo "[+] Creating Python virtual environment at $VENV_DIR ..."
-    python3 -m venv "$VENV_DIR"
+    python3.12 -m venv "$VENV_DIR"
     echo "[✓] Virtual environment created"
 else
     echo "[✓] Virtual environment already exists — skipping creation"
@@ -29,22 +29,8 @@ fi
 source "${VENV_DIR}/bin/activate"
 echo "[✓] Virtual environment activated: ${VIRTUAL_ENV}"
 
-pip install --upgrade pip --quiet
-
 # Cài các thư viện của Python
 pip install -r "${PROJECT_ROOT}/requirements.txt"
-
-# Cài AWS CLI
-if ! command -v aws &>/dev/null; then
-    echo "[+] Installing AWS CLI..."
-    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-    unzip -q /tmp/awscliv2.zip -d /tmp/
-    sudo /tmp/aws/install
-    rm -rf /tmp/awscliv2.zip /tmp/aws
-    echo "[✓] AWS CLI installed: $(aws --version)"
-else
-    echo "[✓] AWS CLI already installed: $(aws --version) — skipping"
-fi
 
 # Cài Docker
 if ! command -v docker &>/dev/null; then
