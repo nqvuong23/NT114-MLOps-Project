@@ -41,7 +41,6 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${SPARK_DIR:-.}/jobs:/opt/spark/jobs
-    - spark-ivy-cache:/home/airflow/.ivy2
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -346,4 +345,3 @@ services:
 
 volumes:
   postgres-db-volume:
-  spark-ivy-cache:

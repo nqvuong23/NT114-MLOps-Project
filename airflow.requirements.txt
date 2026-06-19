@@ -2,8 +2,9 @@ pandas
 numpy
 pyarrow
 pyspark
+s3fs
 boto3
 psycopg2-binary
 requests
-great-expectations
+great-expectations==1.18.1
 slack-sdk

@@ -13,7 +13,7 @@ import os
 import logging
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType, DoubleType
+from pyspark.sql.types import IntegerType, DoubleType, LongType
 from pyspark.ml.feature import StandardScaler, VectorAssembler
 from pyspark.ml import Pipeline
 
@@ -46,6 +46,16 @@ def get_spark_session(app_name: str = "FraudDetection-Cleaning") -> SparkSession
                 "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.aws.credentials.provider",
                 "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+        .config("spark.sql.legacy.parquet.nanosAsLong", "true")
+        .config("spark.sql.parquet.enableVectorizedReader", "false")
+        .config("spark.hadoop.fs.s3a.connection.timeout", "60000")   
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "30000") 
+        .config("spark.hadoop.fs.s3a.socket.timeout", "30000")
+        .config("spark.hadoop.fs.s3a.paging.maximum.timeout", "60000")
+        .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60")
+        .config("spark.hadoop.fs.s3a.multipart.purge.age", "86400")
+        .config("spark.hadoop.fs.s3a.retry.interval", "5")
+        .config("spark.hadoop.fs.s3a.retry.throttled.interval", "10")
         # Tắt UI để nhẹ hơn khi chạy trong Airflow worker
         .config("spark.ui.enabled", "false")
         .getOrCreate()
@@ -96,6 +106,10 @@ def clean_and_transform(
         })
 
         # ── Chuẩn hóa timestamp ───────────────────────────────────────────
+        if isinstance(df.schema["timestamp"].dataType, (LongType, IntegerType)):
+            df = df.withColumn("timestamp", F.to_timestamp(F.col("timestamp") / 1000000000))
+        else:
+            df = df.withColumn("timestamp", F.to_timestamp("timestamp"))
         df = df.withColumn(
             "timestamp",
             F.date_format(F.to_timestamp("timestamp"), "yyyy-MM-dd'T'HH:mm:ss'Z'")

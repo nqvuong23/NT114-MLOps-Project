@@ -2,9 +2,9 @@
 ge_validations.py
 =================
 Great Expectations validation suites cho 3 giai đoạn:
-  1. raw_data_suite      — kiểm tra data thô từ RDS
+  1. raw_data_suite       — kiểm tra data thô từ RDS
   2. processed_data_suite — kiểm tra sau cleaning & transformation
-  3. feature_suite       — kiểm tra sau feature engineering
+  3. feature_suite        — kiểm tra sau feature engineering
 
 Mỗi suite trả về (passed: bool, results: dict)
 """
@@ -74,27 +74,32 @@ def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple
     # Truyền dữ liệu DataFrame động vào tham số chạy checkpoint
     checkpoint_result = checkpoint.run(batch_parameters={"dataframe": df})
 
-    # 8. [ĐÃ FIX Ở ĐÂY] Trích xuất kết quả dựa trên cấu trúc thuộc tính .run_results của 1.x
+    # =====================================================================
+    # 8. TRÍCH XUẤT KẾT QUẢ ĐÃ ĐƯỢC TINH GỌN & TỐI ƯU
+    # =====================================================================
     success = checkpoint_result.success
     failed_expectations = []
     total_expectations = 0
 
-    # Duyệt qua các run_results bên trong CheckpointResult
-    for run_result in checkpoint_result.run_results.values():
-        validation_result = run_result.get("validation_result")
-        if validation_result and hasattr(validation_result, "results"):
-            for r in validation_result.results:
-                total_expectations += 1
-                if not r.success:
-                    config = r.expectation_config
-                    exp_type = config.type if hasattr(config, "type") else getattr(config, "expectation_type", "N/A")
-                    
-                    failed_expectations.append({
-                        "expectation_type": exp_type,
-                        "column": config.kwargs.get("column", "N/A"),
-                        "result": str(r.result),
-                        "success": r.success,
-                    })
+    # Bộ trích xuất động: Tự nhận diện cấu trúc để lấy data từ cả Dict hoặc Object thuộc tính
+    get_val = lambda obj, key, default=None: obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+    for val_res in checkpoint_result.run_results.values():
+        for r in get_val(val_res, "results", []):
+            total_expectations += 1
+            
+            # Nếu quy tắc kiểm tra bị thất bại (success == False)
+            if not get_val(r, "success", False):
+                config = get_val(r, "expectation_config", {})
+                kwargs = get_val(config, "kwargs", {})
+                
+                failed_expectations.append({
+                    # Đọc key "type" chuẩn theo log thực tế bạn cung cấp
+                    "expectation_type": get_val(config, "type", get_val(config, "expectation_type", "N/A")),
+                    "column": kwargs.get("column", "N/A"),
+                    "result": str(get_val(r, "result", {})),
+                    "success": False,
+                })
 
     return success, {
         "suite": suite_name,
