@@ -13,14 +13,6 @@ Flow:
   6. run_spark_features     → Spark feature engineering
   7. validate_features      → Great Expectations validate features
   8. call_fraud_api         → Gọi API Gateway → Lambda → ECS Model
-  9. save_predictions       → Lưu prediction vào S3 /prediction/
- 10. dvc_track              → DVC track tất cả S3 outputs
-
-Airflow 3.x compatibility:
-  - execution_date bị xóa → dùng logical_date
-  - email/email_on_failure trong default_args bị deprecated → xóa
-  - datetime.utcnow() → datetime.now(tz=timezone.utc)
-  - Import DAG từ airflow.sdk thay vì airflow (Airflow 3.x)
 """
 
 import os
@@ -48,13 +40,13 @@ from alert_utils import send_alert, airflow_failure_callback
 logger = logging.getLogger(__name__)
 
 # ── Config từ Environment ────────────────────────────────────────────────────
-S3_BUCKET        = os.environ.get("S3_BUCKET", "")
-S3_RAW           = os.environ.get("S3_RAW_PREFIX", "raw-data")
-S3_PROCESSED     = os.environ.get("S3_PROCESSED_PREFIX", "processed-data")
-S3_FEATURE       = os.environ.get("S3_FEATURE_PREFIX", "feature-store")
-S3_PREDICTION    = os.environ.get("S3_PREDICTION_PREFIX", "prediction")
-S3_DEAD_LETTER   = os.environ.get("S3_DEAD_LETTER_PREFIX", "dead-letter")
-SPARK_JOBS_DIR   = "/opt/spark/jobs"
+S3_BUCKET        = os.environ.get("S3_BUCKET_NAME", "")
+S3_RAW           = os.environ.get("S3_PREFIX_RAW", "raw-data")
+S3_PROCESSED     = os.environ.get("S3_PREFIX_PROCESSED", "processed-data")
+S3_FEATURE       = os.environ.get("S3_PREFIX_FEATURE", "feature-store")
+S3_PREDICTION    = os.environ.get("S3_PREFIX_PREDICTION", "prediction")
+S3_DEAD_LETTER   = os.environ.get("S3_PREFIX_DEAD_LETTER", "dead-letter")
+SPARK_JOBS_DIR   = os.environ.get("SPARK_JOBS_DIR")
 API_GATEWAY_URL  = os.environ.get("API_GATEWAY_URL", "")
 API_USERNAME     = os.environ.get("API_GATEWAY_USERNAME", "admin")
 API_PASSWORD     = os.environ.get("API_GATEWAY_PASSWORD", "")
@@ -301,7 +293,7 @@ def run_spark_cleaning(**context):
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
     input_path  = f"s3a://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet"
-    output_path = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet"
+    output_path = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}"
 
     from spark_cleaning import clean_and_transform, get_spark_session
 
@@ -338,7 +330,7 @@ def validate_processed(**context):
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
     import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet/"
+    s3_path = f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/"
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:
@@ -369,8 +361,8 @@ def run_spark_features(**context):
     import json
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
  
-    input_path  = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet/"
-    output_path = f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet"
+    input_path  = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/"
+    output_path = f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}"
  
     from spark_feature_engineering import feature_engineering, get_spark_session
  
@@ -409,14 +401,14 @@ def validate_features(**context):
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
     import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet/"
+    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/"
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:
         raise RuntimeError(f"Cannot read feature data from S3: {e}")
 
-    from ge_validations import validate_features as ge_validate_features, log_validation_result
-    passed, result = ge_validate_features(df)
+    from ge_validations import validate_feature_store, log_validation_result
+    passed, result = validate_feature_store(df)
     log_validation_result(result, "features")
 
     if not passed:
@@ -448,7 +440,7 @@ def call_fraud_api(**context):
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
     import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet/"
+    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/"
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:

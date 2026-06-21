@@ -8,3 +8,8 @@ psycopg2-binary
 requests
 great-expectations==1.18.1
 slack-sdk
+evidently==0.4.36
+xgboost
+optuna
+mlflow
+scikit-learn

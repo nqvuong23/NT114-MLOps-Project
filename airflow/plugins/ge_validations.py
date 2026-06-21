@@ -196,7 +196,7 @@ def validate_processed_data(df: pd.DataFrame) -> Tuple[bool, dict]:
 
 
 # ── Suite 3: Feature Dataset Validation ──────────────────────────────────────
-def validate_features(df: pd.DataFrame) -> Tuple[bool, dict]:
+def validate_feature_store(df: pd.DataFrame) -> Tuple[bool, dict]:
     """
     Validate feature dataset sau feature engineering.
     Kiểm tra: không NaN, không constant feature, distribution hợp lý.
