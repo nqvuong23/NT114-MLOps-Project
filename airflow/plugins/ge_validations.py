@@ -2,9 +2,9 @@
 ge_validations.py
 =================
 Great Expectations validation suites cho 3 giai đoạn:
-  1. raw_data_suite      — kiểm tra data thô từ RDS
+  1. raw_data_suite       — kiểm tra data thô từ RDS
   2. processed_data_suite — kiểm tra sau cleaning & transformation
-  3. feature_suite       — kiểm tra sau feature engineering
+  3. feature_suite        — kiểm tra sau feature engineering
 
 Mỗi suite trả về (passed: bool, results: dict)
 """
@@ -23,49 +23,88 @@ V_COLS = [f"V{i}" for i in range(1, 29)]
 
 def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple[bool, dict]:
     """
-    Sử dụng Fluent API (chuẩn 0.18.x) để validate trực tiếp Pandas DataFrame.
+    Sử dụng Batch Definition & Checkpoint chuẩn GX 1.x kết hợp Validator 
+    để chạy mượt mà với các hàm định nghĩa suite cũ.
     """
     # 1. Khởi tạo Ephemeral context (Chạy hoàn toàn trên RAM)
     context = gx.get_context(mode="ephemeral")
     
-    # 2. Sử dụng FLUENT API: context.data_sources (Không phải context.sources)
-    datasource = context.data_sources.add_pandas(name=f"{suite_name}_datasource")
-    data_asset = datasource.add_dataframe_asset(name=f"{suite_name}_asset")
-    
-    # 3. Đưa DataFrame vào Asset để tạo Batch Request
-    batch_request = data_asset.build_batch_request(dataframe=df)
-    
-    # 4. Khởi tạo Suite và Validator
-    context.add_or_update_expectation_suite(expectation_suite_name=suite_name)
-    validator = context.get_validator(
-        batch_request=batch_request,
-        expectation_suite_name=suite_name,
+    # 2. Tạo Data Source và Data Asset bằng Fluent API của 1.x
+    data_source = context.data_sources.add_pandas(name=f"{suite_name}_source")
+    data_asset = data_source.add_dataframe_asset(name=f"{suite_name}_asset")
+
+    # 3. Tạo Batch Definition để định nghĩa tập dữ liệu kiểm tra
+    batch_definition = data_asset.add_batch_definition_whole_dataframe(
+        name=f"{suite_name}_batch_def" 
     )
+
+    # 4. Khởi tạo Object Suite trống
+    suite = gx.ExpectationSuite(name=f"{suite_name}_suite")
+
+    # 5. Dùng Validator để nạp toàn bộ hàm `expectations_fn` vào Suite
+    batch_request = batch_definition.build_batch_request(batch_parameters={"dataframe": df})
+    validator = context.get_validator(batch_request=batch_request, expectation_suite=suite)
     
-    # 5. Gắn các rules (expectations) vào validator
+    # Chạy hàm callback chứa các luật v.expect_... của bạn
     expectations_fn(validator)
     
-    # 6. Chạy quá trình chấm điểm (validate)
-    result = validator.validate()
+    # Lưu lại vào context
+    validator.save_expectation_suite()
+
+    # Lấy suite đã được lưu chính thức trong context ra
+    saved_suite = context.suites.get(name=f"{suite_name}_suite")
+
+    # 6. Tạo Validation Definition kết hợp Batch Definition và Suite đã lưu
+    validation_definition = context.validation_definitions.add(
+        gx.ValidationDefinition(
+            name=f"{suite_name}_val_def",
+            data=batch_definition,
+            suite=saved_suite
+        )
+    )
+
+    # 7. Khởi tạo Checkpoint và thực thi việc validate dữ liệu
+    checkpoint = context.checkpoints.add(
+        gx.Checkpoint(
+            name=f"{suite_name}_checkpoint",
+            validation_definitions=[validation_definition]
+        )
+    )
     
-    success = result.success
-    
-    # 7. Trích xuất thông tin các rules bị fail để log và alert
-    failed_expectations = [
-        {
-            "expectation_type": r.expectation_config.expectation_type,
-            "column": r.expectation_config.kwargs.get("column", "N/A"),
-            "result": str(r.result),
-            "success": r.success,
-        }
-        for r in result.results
-        if not r.success
-    ]
+    # Truyền dữ liệu DataFrame động vào tham số chạy checkpoint
+    checkpoint_result = checkpoint.run(batch_parameters={"dataframe": df})
+
+    # =====================================================================
+    # 8. TRÍCH XUẤT KẾT QUẢ ĐÃ ĐƯỢC TINH GỌN & TỐI ƯU
+    # =====================================================================
+    success = checkpoint_result.success
+    failed_expectations = []
+    total_expectations = 0
+
+    # Bộ trích xuất động: Tự nhận diện cấu trúc để lấy data từ cả Dict hoặc Object thuộc tính
+    get_val = lambda obj, key, default=None: obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+    for val_res in checkpoint_result.run_results.values():
+        for r in get_val(val_res, "results", []):
+            total_expectations += 1
+            
+            # Nếu quy tắc kiểm tra bị thất bại (success == False)
+            if not get_val(r, "success", False):
+                config = get_val(r, "expectation_config", {})
+                kwargs = get_val(config, "kwargs", {})
+                
+                failed_expectations.append({
+                    # Đọc key "type" chuẩn theo log thực tế bạn cung cấp
+                    "expectation_type": get_val(config, "type", get_val(config, "expectation_type", "N/A")),
+                    "column": kwargs.get("column", "N/A"),
+                    "result": str(get_val(r, "result", {})),
+                    "success": False,
+                })
 
     return success, {
         "suite": suite_name,
         "passed": success,
-        "total_expectations": len(result.results),
+        "total_expectations": total_expectations,
         "failed_count": len(failed_expectations),
         "failed_expectations": failed_expectations,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),

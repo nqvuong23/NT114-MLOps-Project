@@ -140,6 +140,42 @@ def write_dead_letter(df: pd.DataFrame, batch_id: str, step: str, reason: str):
     s3.put_object(Bucket=S3_BUCKET, Key=reason_key, Body=reason.encode())
     logger.warning(f"Dead letter written: s3://{S3_BUCKET}/{key}")
 
+def build_request_body(df: pd.DataFrame, limit: int = None) -> dict:
+    """
+    Chuyển DataFrame thành request body đúng format model.
+
+    Mapping:
+      hour_of_day → Time   (proxy cho Time trong Kaggle dataset)
+      amount      → Amount
+      V1..V28     → V1..V28
+
+    Args:
+        df   : DataFrame từ feature-store
+        limit: Giới hạn số rows gửi (None = gửi tất cả)
+
+    Returns:
+        {"request_data": [...]}
+    """
+    if limit:
+        df = df.head(limit)
+
+    records = []
+    for _, row in df.iterrows():
+        record = {
+            # hour_of_day dùng làm proxy cho "Time" của Kaggle
+            # (Kaggle Time = seconds from first transaction, ở đây dùng giờ trong ngày)
+            "Time": float(row.get("hour_of_day", 0)),
+            "Amount": float(row["amount"]),
+        }
+        # Thêm V1..V28
+        for i in range(1, 29):
+            col = f"V{i}"
+            record[col] = float(row[col]) if col in row.index else 0.0
+
+        records.append(record)
+
+    return {"request_data": records}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TASK FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,11 +184,7 @@ def extract_from_rds(**context):
     """
     Task 1: Query batch data từ RDS dựa vào last_processed_timestamp.
     Lưu timestamp mới vào Airflow Variable.
-
-    Airflow 3.x: execution_date bị xóa → dùng logical_date.
-    logical_date trong Airflow 3.x = run_after time (thời điểm DAG run được queue).
     """
-    # FIX Airflow 3.x: execution_date → logical_date
     logical_date = context["logical_date"]
     batch_id = get_batch_id(logical_date)
     batch_end = logical_date
@@ -235,12 +267,10 @@ def validate_raw(**context):
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
-    s3 = get_s3_client()
     import io
-    key = f"{S3_RAW}/{batch_id}/raw.parquet"
+    s3_path = f"s3://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet"
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        df = pd.read_parquet(s3_path)
     except Exception as e:
         raise RuntimeError(f"Cannot read raw data from S3: {e}")
     
@@ -306,13 +336,11 @@ def validate_processed(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    s3 = get_s3_client()
 
     import io
-    key = f"{S3_PROCESSED}/{batch_id}/processed.parquet"
+    s3_path = f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet/"
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        df = pd.read_parquet(s3_path)
     except Exception as e:
         raise RuntimeError(f"Cannot read processed data from S3: {e}")
 
@@ -341,7 +369,7 @@ def run_spark_features(**context):
     import json
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
  
-    input_path  = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet"
+    input_path  = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet/"
     output_path = f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet"
  
     from spark_feature_engineering import feature_engineering, get_spark_session
@@ -379,13 +407,11 @@ def validate_features(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    s3 = get_s3_client()
 
     import io
-    key = f"{S3_FEATURE}/{batch_id}/features.parquet"
+    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet/"
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        df = pd.read_parquet(s3_path)
     except Exception as e:
         raise RuntimeError(f"Cannot read feature data from S3: {e}")
 
@@ -420,12 +446,14 @@ def call_fraud_api(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    s3 = get_s3_client()
 
     import io
-    key = f"{S3_FEATURE}/{batch_id}/features.parquet"
-    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-    df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet/"
+    try:
+        df = pd.read_parquet(s3_path)
+    except Exception as e:
+        raise RuntimeError(f"Cannot read feature data from S3: {e}")
+    logger.info(f"Loaded {len(df)} rows from {s3_path}")
 
     # ── QUAN TRỌNG: Drop is_fraud_label trước khi gửi đến model ─────────
     inference_df = df.drop(columns=["is_fraud_label"], errors="ignore")
@@ -437,16 +465,24 @@ def call_fraud_api(**context):
     logger.info(f"Inference features: {list(inference_df.columns)}")
 
     # Gọi API theo batch nhỏ 100 records/request
-    api_url = f"{API_GATEWAY_URL}/predict"
-    all_predictions = []
+    api_url    = f"{API_GATEWAY_URL.rstrip('/')}/predict"
     batch_size = 100
+    total_rows = len(inference_df)
+    total_sent = 0
+    failed_chunks = []
 
     for i in range(0, len(inference_df), batch_size):
         chunk = inference_df.iloc[i:i + batch_size]
-        payload = {
-            "batch_id": batch_id,
-            "transactions": chunk.to_dict(orient="records")
-        }
+        chunk_num   = i // batch_size + 1
+        total_chunks = (total_rows + batch_size - 1) // batch_size
+
+        payload = build_request_body(chunk)
+
+        logger.info(
+            f"Chunk {chunk_num}/{total_chunks}: "
+            f"{len(payload['request_data'])} rows → POST {api_url}"
+        )
+
         try:
             resp = requests.post(
                 api_url,
@@ -456,115 +492,53 @@ def call_fraud_api(**context):
                 headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
-            preds = resp.json().get("predictions", [])
-            all_predictions.extend(preds)
+
             logger.info(f"  API chunk {i//batch_size + 1}: {len(preds)} predictions")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API call failed for chunk {i}: {e}")
-            # Tiếp tục với chunk khác, không dừng pipeline
-            # Điền prediction = -1 cho các record bị lỗi
-            all_predictions.extend([-1] * len(chunk))
+            # Log response
+            try:
+                resp_data = resp.json()
+                logger.info(f"Chunk {chunk_num} OK | status: {resp.status_code} | response: {str(resp_data)[:200]}")
+            except Exception:
+                logger.info(f"Chunk {chunk_num} OK | status: {resp.status_code}")
 
-    # Kết hợp predictions với transaction_id
-    result_df = pd.DataFrame({
-        "transaction_id": df["transaction_id"].tolist()[:len(all_predictions)],
-        "batch_id": batch_id,
-        "predicted_fraud": all_predictions,
-        "prediction_timestamp": datetime.now(tz=timezone.utc).isoformat(),
-    })
-
-    ti.xcom_push(key="predictions_json", value=result_df.to_json(orient="records"))
-    ti.xcom_push(key="prediction_count", value=len(result_df))
-    fraud_predicted = sum(1 for p in all_predictions if p == 1)
-    logger.info(f"Predictions: {len(all_predictions)} total | fraud detected: {fraud_predicted}")
-
-
-def save_predictions(**context):
-    """Task 9: Lưu predictions vào S3 /prediction/{batch_id}/"""
-    ti = context["ti"]
-    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
-    if skip:
-        return
-
-    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-    preds_json = ti.xcom_pull(key="predictions_json", task_ids="call_fraud_api")
-
-    if not preds_json:
-        logger.warning("No predictions to save")
-        return
-
-    df = pd.read_json(preds_json, orient="records")
-    s3_key = f"{S3_PREDICTION}/{batch_id}/predictions.parquet"
-    s3_path = upload_parquet_to_s3(df, s3_key)
-    ti.xcom_push(key="prediction_s3_path", value=s3_path)
-    logger.info(f"Predictions saved: {s3_path}")
-
-
-def dvc_track(**context):
-    """
-    Task 10: DVC track tất cả S3 outputs của batch này.
-    - Chạy dvc add cho từng file trên S3
-    - Commit .dvc files vào Git
-    """
-    ti = context["ti"]
-    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
-    if skip:
-        return
-
-    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-
-    # Các paths cần DVC track
-    paths_to_track = [
-        f"s3://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet",
-        f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/processed.parquet",
-        f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/features.parquet",
-        f"s3://{S3_BUCKET}/{S3_PREDICTION}/{batch_id}/predictions.parquet",
-    ]
-
-    dvc_project_dir = "/opt/airflow/dvc_project"
-    os.makedirs(dvc_project_dir, exist_ok=True)
-
-    for s3_path in paths_to_track:
-        try:
-            # Dùng DVC import-url để track S3 object
-            cmd = ["dvc", "import-url", "--no-download", s3_path]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=dvc_project_dir,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                logger.info(f"DVC tracked: {s3_path}")
-            else:
-                logger.warning(f"DVC track warning for {s3_path}: {result.stderr}")
+            total_sent += len(chunk)
+        
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Chunk {chunk_num} HTTP error: {e} | body: {resp.text[:300]}")
+            failed_chunks.append(chunk_num)
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Chunk {chunk_num} Connection error: {e}")
+            failed_chunks.append(chunk_num)
+        except requests.exceptions.Timeout:
+            logger.error(f"Chunk {chunk_num} Timeout after 60s")
+            failed_chunks.append(chunk_num)
         except Exception as e:
-            logger.warning(f"DVC track failed for {s3_path}: {e} (non-blocking)")
+            logger.error(f"Chunk {chunk_num} Unexpected error: {e}")
+            failed_chunks.append(chunk_num)
 
-    # Ghi DVC metadata JSON
-    dvc_meta = {
-        "batch_id": batch_id,
-        "tracked_at": datetime.now(tz=timezone.utc).isoformat(),
-        "paths": paths_to_track,
-        "row_count": ti.xcom_pull(key="row_count", task_ids="extract_from_rds"),
-    }
-    meta_key = f"dvc-metadata/{batch_id}/meta.json"
-    s3 = get_s3_client()
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=meta_key,
-        Body=json.dumps(dvc_meta, indent=2).encode()
-    )
-    logger.info(f"DVC metadata saved: s3://{S3_BUCKET}/{meta_key}")
-
-    send_alert(
-        subject=f"Pipeline Completed — batch {batch_id}",
-        message=f"All steps completed successfully.\nBatch: {batch_id}",
-        level="success",
-        context={"batch_id": batch_id, "paths": str(len(paths_to_track))}
+    # ── Tổng kết ──────────────────────────────────────────────────────────
+    total_chunks = (total_rows + batch_size - 1) // batch_size
+    logger.info(
+        f"API call complete: {total_sent}/{total_rows} rows sent | "
+        f"failed chunks: {len(failed_chunks)}/{total_chunks}"
     )
 
+    # Nếu TẤT CẢ chunks đều fail → raise để Airflow mark task failed
+    if len(failed_chunks) == total_chunks:
+        raise RuntimeError(
+            f"All {total_chunks} API chunks failed. "
+            f"Check API_GATEWAY_URL ({API_GATEWAY_URL}) and credentials."
+        )
+
+    # Nếu một phần fail → warning, không dừng
+    if failed_chunks:
+        logger.warning(f"Partial failure: chunks {failed_chunks} failed")
+        send_alert(
+            subject=f"Test API: Partial failure — batch {batch_id}",
+            message=f"{len(failed_chunks)}/{total_chunks} chunks failed.",
+            level="warning",
+            context={"batch_id": batch_id, "failed_chunks": str(failed_chunks)},
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TASK DEFINITIONS
@@ -614,16 +588,6 @@ with dag:
         execution_timeout=timedelta(minutes=10),
     )
 
-    t9_save_preds = PythonOperator(
-        task_id="save_predictions",
-        python_callable=save_predictions,
-    )
-
-    t10_dvc = PythonOperator(
-        task_id="dvc_track",
-        python_callable=dvc_track,
-    )
-
     # ── Pipeline Flow ─────────────────────────────────────────────────────
     (
         t1_extract
@@ -634,6 +598,4 @@ with dag:
         >> t6_spark_features
         >> t7_validate_features
         >> t8_call_api
-        >> t9_save_preds
-        >> t10_dvc
     )

@@ -48,6 +48,7 @@ airflow/config/*
 
 # Python virtual environment
 venv/
+.venv/
 
 # Large datasets
 *.csv
@@ -63,6 +64,9 @@ __pycache__/
 
 .env
 
+
+dvc_project/
+
 # Model artifacts and config
 model/
 scaler_stats.json
@@ -71,3 +75,5 @@ imagedefinitions.json
 # BentoML build files
 .bento/
 *.bento
+
+testing/

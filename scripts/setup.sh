@@ -14,12 +14,12 @@ VENV_DIR="${PROJECT_ROOT}/.venv"
 
 # Tải các package cần thiết
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip unzip ca-certificates curl tar
+sudo apt install -y python3.12 python3.12-venv python3-pip ca-certificates curl
 
 # ── Tạo và kích hoạt Virtual Environment ─────────────────────────────────────
 if [ ! -d "$VENV_DIR" ]; then
     echo "[+] Creating Python virtual environment at $VENV_DIR ..."
-    python3 -m venv "$VENV_DIR"
+    python3.12 -m venv "$VENV_DIR"
     echo "[✓] Virtual environment created"
 else
     echo "[✓] Virtual environment already exists — skipping creation"
@@ -29,22 +29,8 @@ fi
 source "${VENV_DIR}/bin/activate"
 echo "[✓] Virtual environment activated: ${VIRTUAL_ENV}"
 
-pip install --upgrade pip --quiet
-
 # Cài các thư viện của Python
 pip install -r "${PROJECT_ROOT}/requirements.txt"
-
-# Cài AWS CLI
-if ! command -v aws &>/dev/null; then
-    echo "[+] Installing AWS CLI..."
-    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-    unzip -q /tmp/awscliv2.zip -d /tmp/
-    sudo /tmp/aws/install
-    rm -rf /tmp/awscliv2.zip /tmp/aws
-    echo "[✓] AWS CLI installed: $(aws --version)"
-else
-    echo "[✓] AWS CLI already installed: $(aws --version) — skipping"
-fi
 
 # Cài Docker
 if ! command -v docker &>/dev/null; then
@@ -186,13 +172,10 @@ else
 fi
 
 # Cài Apache Airflow và MLflow và Spark
-echo "[+] Setting Spark Notebooks directory permissions..."
-mkdir -p "${PROJECT_ROOT}/spark/spark_notebooks"
-sudo chmod -R 777 "${PROJECT_ROOT}/spark/spark_notebooks"
 echo "[+] Setting Airflow directory permissions..."
 sudo mkdir -p "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
 sudo chown -R 50000:0 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
-sudo chmod -R 775 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
+sudo chmod -R 777 "${PROJECT_ROOT}/airflow/"{logs,dags,plugins,config}
 
 echo "[+] Starting Airflow + MLflow via docker compose..."
 docker compose -f "${PROJECT_ROOT}/docker-compose.yaml" up -d || true
@@ -203,74 +186,3 @@ echo "========================================="
 echo " VM Setup COMPLETE ✅"
 echo "========================================="
 echo ""
-
-echo "========================================="
-echo " DVC Setup for Fraud Detection MLOps"
-echo "========================================="
-
-# ── Cài DVC + S3 support ───────────────────────────────────────────────────
-if ! command -v dvc &>/dev/null; then
-    echo "[1/5] Installing DVC with S3 support..."
-    pip install "dvc[s3]" --quiet
-    echo "[✓] DVC installed: $(dvc --version)"
-else
-    echo "[1/5] DVC already installed: $(dvc --version) — skipping"
-fi
-
-# ── Init DVC project ───────────────────────────────────────────────────────
-DVC_PROJECT_DIR="$PROJECT_ROOT/dvc_project"
-mkdir -p "$DVC_PROJECT_DIR"
-cd "$DVC_PROJECT_DIR"
- 
-if [ ! -d ".dvc" ]; then
-    echo ""
-    echo "[2/5] Initializing DVC project..."
-    git init 2>/dev/null || true
-    dvc init
-    echo "[✓] DVC initialized"
-else
-    echo "[2/5] DVC already initialized — skipping"
-fi
-
-
-# ── Cấu hình S3 remote ─────────────────────────────────────────────────────
-echo ""
-echo "[3/5] Configuring S3 remote..."
- 
-S3_REMOTE_URL="s3://${S3_BUCKET}/${S3_DVC_REMOTE:-dvc-store}"
- 
-dvc remote add -f myremote "$S3_REMOTE_URL" 2>/dev/null || true
-dvc remote modify myremote region "${AWS_DEFAULT_REGION:-ap-southeast-1}"
-dvc remote default myremote
- 
-echo "[✓] DVC remote: $S3_REMOTE_URL"
- 
-# ── Tạo .dvcignore ─────────────────────────────────────────────────────────
-echo ""
-echo "[4/5] Creating .dvcignore..."
-cat > .dvcignore << 'EOF'
-# DVC ignore file
-__pycache__
-*.pyc
-.DS_Store
-*.log
-EOF
- 
-# ── Commit initial DVC config ──────────────────────────────────────────────
-echo ""
-echo "[5/5] Committing DVC config to git..."
-git add .dvc/ .dvcignore 2>/dev/null || true
-git config user.email "mlops@fraud-detection.local" 2>/dev/null || true
-git config user.name "MLOps Pipeline" 2>/dev/null || true
-git commit -m "feat: initialize DVC with S3 remote" --allow-empty 2>/dev/null || true
- 
-echo ""
-echo "========================================="
-echo " DVC Setup COMPLETE ✅"
-echo " Remote: $S3_REMOTE_URL"
-echo " Project: $DVC_PROJECT_DIR"
-echo "========================================="
-echo ""
-echo "Test DVC connection:"
-echo "  cd $DVC_PROJECT_DIR"
-echo "  dvc remote list"

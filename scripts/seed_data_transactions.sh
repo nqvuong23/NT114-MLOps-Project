@@ -13,7 +13,7 @@ else
 fi
 
 # Seed 500 transactions (cold start)
-python3 scripts/simulate_transactions.py --count 500 --batch-seconds 3600
+python3 scripts/simulate_transactions.py --count 500 --batch-seconds 300
 
 # Kiểm tra data trong RDS
 python3 - << 'EOF'

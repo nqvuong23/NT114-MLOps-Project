@@ -218,7 +218,7 @@ def main(n: int, batch_seconds: int = 300):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simulate fraud detection transactions")
-    parser.add_argument("--count", type=int, default=100,
+    parser.add_argument("--count", type=int, default=500,
                         help="Number of transactions to generate (default: 100)")
     parser.add_argument("--batch-seconds", type=int, default=300,
                         help="Spread transactions over this many seconds (default: 300 = 5min)")
