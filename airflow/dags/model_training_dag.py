@@ -31,6 +31,7 @@ import os
 import io
 import json
 import logging
+import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -122,17 +123,32 @@ def list_merged_weekly_files() -> list[str]:
     return keys
 
 
-def list_current_week_batches() -> list[str]:
+def list_current_week_batches(trigger_reason: str = "scheduled") -> list[str]:
     """
-    Liệt kê tất cả batch folders trong feature-store/ của tuần hiện tại.
+    Liệt kê tất cả batch folders trong feature-store/ theo trigger_reason.
     Batch_id format: YYYYMMDD_HHMMSS
-    Tuần hiện tại = từ thứ Hai tuần này đến lúc chạy.
+
+    - scheduled (Monday 2 AM): liệt kê toàn bộ batch của tuần TRƯỚC
+      (Monday 00:00 → Sunday 23:59 UTC của tuần trước),
+      vì lúc 2 AM thứ Hai tuần hiện tại, dữ liệu tuần trước mới vừa kết thúc.
+    - drift-triggered (non-Monday): liệt kê batch từ thứ Hai tuần này đến thời điểm chạy.
     """
     s3 = get_s3()
 
-    today  = datetime.now(tz=timezone.utc).date()
-    monday = today - timedelta(days=today.weekday())
-    cutoff = datetime.combine(monday, datetime.min.time()).replace(tzinfo=timezone.utc)
+    now   = datetime.now(tz=timezone.utc)
+    today = now.date()
+
+    if trigger_reason == "scheduled":
+        # Lấy Monday của tuần TRƯỚC
+        this_monday = today - timedelta(days=today.weekday())  # Monday of current week
+        prev_monday = this_monday - timedelta(weeks=1)          # Monday of previous week
+        cutoff_start = datetime.combine(prev_monday, datetime.min.time()).replace(tzinfo=timezone.utc)
+        cutoff_end   = datetime.combine(this_monday, datetime.min.time()).replace(tzinfo=timezone.utc)  # exclusive upper bound
+    else:
+        # Drift-triggered: batch từ thứ Hai tuần này đến lúc chạy
+        this_monday = today - timedelta(days=today.weekday())
+        cutoff_start = datetime.combine(this_monday, datetime.min.time()).replace(tzinfo=timezone.utc)
+        cutoff_end   = now  # up to now
 
     paginator = s3.get_paginator("list_objects_v2")
     pages     = paginator.paginate(
@@ -141,7 +157,7 @@ def list_current_week_batches() -> list[str]:
         Delimiter="/",
     )
 
-    current_week_batch_paths = []
+    batch_paths = []
     for page in pages:
         for prefix_obj in page.get("CommonPrefixes", []):
             # prefix_obj["Prefix"] = "feature-store/20250113_120000/"
@@ -150,14 +166,14 @@ def list_current_week_batches() -> list[str]:
                 batch_time = datetime.strptime(batch_id, "%Y%m%d_%H%M%S").replace(
                     tzinfo=timezone.utc
                 )
-                if batch_time >= cutoff:
-                    current_week_batch_paths.append(
+                if cutoff_start <= batch_time < cutoff_end:
+                    batch_paths.append(
                         f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/*.parquet"
                     )
             except ValueError:
                 continue
 
-    return sorted(current_week_batch_paths)
+    return sorted(batch_paths)
 
 
 def prepare_features(df_input: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -210,28 +226,40 @@ def collect_dataset(**context):
     Xác định:
       - Trigger từ schedule hay từ drift detection
       - Danh sách weekly merged files (tuần cũ)
-      - Danh sách batch lẻ của tuần hiện tại
+      - Danh sách batch lẻ của tuần hiện tại (hoặc tuần trước nếu scheduled)
+
+    Điều chỉnh theo trigger_reason:
+      - scheduled (Monday 2 AM): lấy toàn bộ batch tuần TRƯỚC → merged files không bao gồm tuần trước
+      - drift (non-Monday): lấy batch từ Monday tuần này đến lúc chạy
     """
     # Lấy trigger reason từ DAG conf
     trigger_reason = context["dag_run"].conf.get("trigger_reason", "scheduled")
     logger.info(f"Training triggered by: {trigger_reason}")
 
-    # Danh sách weekly merged files (tuần đã hoàn thành)
-    merged_files   = list_merged_weekly_files()
-    # Batch lẻ tuần hiện tại (chưa merge)
-    current_batches = list_current_week_batches()
+    # Danh sách weekly merged files (các tuần đã hoàn thành trước đó)
+    merged_files    = list_merged_weekly_files()
+    # Batch lẻ theo trigger_reason:
+    #   - scheduled → batch của tuần trước (sẽ được merge thành file tuần trước)
+    #   - drift     → batch từ Monday tuần này đến lúc chạy
+    current_batches = list_current_week_batches(trigger_reason=trigger_reason)
 
-    logger.info(f"Weekly merged files: {len(merged_files)}")
-    logger.info(f"Current week batches (unmerged): {len(current_batches)}")
+    logger.info(f"Weekly merged files  : {len(merged_files)} | trigger: {trigger_reason}")
+    logger.info(f"Batches to merge now : {len(current_batches)}")
 
     if not merged_files and not current_batches:
         # Chỉ dùng Kaggle baseline
         logger.warning("No pipeline data found — will train on Kaggle baseline only")
 
+    # week_key luôn là Monday của tuần HIỆN TẠI
+    # Với scheduled run: week_key chỉ đến tuần hiện tại nhưng file merge là của tuần trước
     week_key = get_week_key()
+
+    # is_scheduled giúp finalize_weekly_merge quyết định rename hay delete
+    is_scheduled = (trigger_reason == "scheduled")
 
     ti = context["ti"]
     ti.xcom_push(key="trigger_reason",   value=trigger_reason)
+    ti.xcom_push(key="is_scheduled",     value=is_scheduled)
     ti.xcom_push(key="merged_files",     value=merged_files)
     ti.xcom_push(key="current_batches",  value=current_batches)
     ti.xcom_push(key="week_key",         value=week_key)
@@ -503,44 +531,68 @@ def run_training(**context):
 
 def finalize_weekly_merge(**context):
     """
-    Task 4: Sau khi training thành công, đổi tên file tạm thành file chính thức.
+    Task 4: Xử lý file merge tạm sau khi training thành công.
 
-    week_{date}_temp → week_{date}
+    Hành vi phụ thuộc vào trigger_reason:
+
+    - scheduled (Monday 2 AM):
+        Đổi tên file tạm thành file chính thức:
+        {S3_MERGED}/{week_key}_temp → {S3_MERGED}/{week_key}
+        Lý do: đây là merge đầy đủ toàn bộ batch của tuần trước,
+        file này sẽ được dùng lại ở các lần training kế tiếp.
+
+    - drift-triggered (non-Monday, e.g., Wednesday / Friday):
+        XÓA file tạm thay vì đổi tên.
+        Lý do: file này chỉ chứa batch từ Monday đến lúc chạy,
+        chưa đủ toàn bộ tuần. Thứ Hai tới (scheduled) sẽ tạo lại
+        file merge đầy đủ cho toàn bộ tuần từ tất cả batch.
 
     Lý do làm sau khi training (không phải trước):
     Nếu training fail, file temp vẫn có thể dùng lại ở lần retry
-    mà không cần merge lại từ 2016 batches.
+    mà không cần merge lại.
     """
-    ti       = context["ti"]
-    temp_key = ti.xcom_pull(key="temp_merged_key", task_ids="merge_current_batches")
-    week_key = ti.xcom_pull(key="week_key",        task_ids="collect_dataset")
+    ti           = context["ti"]
+    temp_key     = ti.xcom_pull(key="temp_merged_key", task_ids="merge_current_batches")
+    week_key     = ti.xcom_pull(key="week_key",        task_ids="collect_dataset")
+    is_scheduled = ti.xcom_pull(key="is_scheduled",    task_ids="collect_dataset")
 
     if not temp_key:
-        logger.info("No temp merged file to finalize")
+        logger.info("No temp merged file to finalize — skipping")
         return
 
     s3 = get_s3()
 
     # Lấy danh sách tất cả file trong folder temp (Spark ghi thành folder)
-    resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=temp_key)
+    resp    = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=temp_key)
     objects = resp.get("Contents", [])
 
-    final_prefix = f"{S3_MERGED}/{week_key}"
+    if not objects:
+        logger.warning(f"Temp prefix '{temp_key}' is empty — nothing to finalize")
+        return
 
-    for obj in objects:
-        old_key = obj["Key"]
-        # Đổi prefix từ _temp sang chính thức
-        new_key = old_key.replace(f"{week_key}_temp", f"{week_key}")
-        # Copy
-        s3.copy_object(
-            Bucket=S3_BUCKET,
-            CopySource={"Bucket": S3_BUCKET, "Key": old_key},
-            Key=new_key,
+    if is_scheduled:
+        # ── Scheduled: rename temp → official ──────────────────────────────
+        final_prefix = f"{S3_MERGED}/{week_key}"
+        for obj in objects:
+            old_key = obj["Key"]
+            new_key = old_key.replace(f"{week_key}_temp", week_key)
+            s3.copy_object(
+                Bucket=S3_BUCKET,
+                CopySource={"Bucket": S3_BUCKET, "Key": old_key},
+                Key=new_key,
+            )
+            s3.delete_object(Bucket=S3_BUCKET, Key=old_key)
+            logger.info(f"Renamed: {old_key} → {new_key}")
+        logger.info(f"Weekly merge finalized (scheduled): s3://{S3_BUCKET}/{final_prefix}")
+    else:
+        # ── Drift-triggered: delete temp file ──────────────────────────────
+        for obj in objects:
+            s3.delete_object(Bucket=S3_BUCKET, Key=obj["Key"])
+            logger.info(f"Deleted temp object: {obj['Key']}")
+        logger.info(
+            f"Temp merge deleted (drift-triggered): '{temp_key}' removed. "
+            "Next Monday scheduled run will create the full weekly merge."
         )
-        # Xóa file temp
-        s3.delete_object(Bucket=S3_BUCKET, Key=old_key)
-
-    logger.info(f"Weekly merge finalized: s3://{S3_BUCKET}/{final_prefix}")
 
 
 def notify(**context):
@@ -575,6 +627,41 @@ def notify(**context):
     )
 
 
+def trigger_codepipeline(**context):
+    """
+    Task 6: Gọi API Gateway (POST) để kích hoạt Lambda → CodePipeline.
+
+    Gửi POST request với empty body đến API_GATEWAY_URL.
+    Request chỉ mang tính tín hiệu (signal) — không cần payload.
+    """
+    api_url = API_GATEWAY_URL
+    if not api_url:
+        raise ValueError(
+            "Environment variable 'API_GATEWAY_URL' is not set. "
+            "Cannot trigger CodePipeline."
+        )
+
+    logger.info(f"Triggering CodePipeline via API Gateway: POST {api_url}")
+    try:
+        response = requests.post(
+            url=api_url,
+            json={},              # empty body — just a trigger signal
+            timeout=30,
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        logger.info(
+            f"CodePipeline triggered successfully. "
+            f"Status: {response.status_code} | Body: {response.text[:200]}"
+        )
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"API Gateway returned an error: {e} | Body: {e.response.text[:200]}")
+        raise
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to call API Gateway: {e}")
+        raise
+
+
 # ── Task Definitions ──────────────────────────────────────────────────────────
 with dag:
     t1_collect  = PythonOperator(task_id="collect_dataset",       python_callable=collect_dataset)
@@ -584,5 +671,6 @@ with dag:
                                  execution_timeout=timedelta(hours=3))
     t4_finalize = PythonOperator(task_id="finalize_weekly_merge", python_callable=finalize_weekly_merge)
     t5_notify   = PythonOperator(task_id="notify",                python_callable=notify)
+    t6_pipeline = PythonOperator(task_id="trigger_codepipeline",  python_callable=trigger_codepipeline)
 
-    t1_collect >> t2_merge >> t3_train >> t4_finalize >> t5_notify
+    t1_collect >> t2_merge >> t3_train >> t4_finalize >> t5_notify >> t6_pipeline
