@@ -9,7 +9,7 @@ Hai nguồn trigger:
 
 Full Retraining strategy với Weekly Merge:
   - Mỗi lần training kết thúc sẽ gộp toàn bộ batch lẻ của tuần đó
-    thành 1 file merged-weekly/week_{date}.parquet
+    thành 1 file merged-weekly/week_{date}/*.parquet
   - Lần training kế tiếp chỉ cần đọc các file weekly đã merge
     + batch lẻ của tuần hiện tại (chưa merge)
   → Tránh phải scan hàng ngàn batch folders mỗi lần training
@@ -58,6 +58,7 @@ MLFLOW_URI       = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-server:5
 AWS_REGION       = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
 MODEL_NAME       = "CreditCardFraudModel"
 AIRFLOW_API_BASE = os.environ.get("AIRFLOW_API_URL", "http://localhost:8080")
+API_GATEWAY_URL = os.environ.get("API_GATEWAY_URL")
 
 # Ngưỡng F1 để promote model mới lên Staging
 PROMOTION_DELTA  = os.environ.get("PROMOTION_DELTA")   # model mới phải tốt hơn ít nhất 0.01
@@ -109,13 +110,13 @@ def get_week_key() -> str:
 
 
 def list_merged_weekly_files() -> list[str]:
-    """Liệt kê tất cả file merged-weekly/*.parquet trên S3, sắp xếp theo thời gian."""
+    """Liệt kê tất cả file training-dataset/weekly/week_YYYYMMDD/*.parquet trên S3, sắp xếp theo thời gian."""
     s3   = get_s3()
     resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"{S3_MERGED}/")
     objs = resp.get("Contents", [])
     keys = sorted(
         [o["Key"] for o in objs if o["Key"].endswith(".parquet")],
-        # Sắp xếp theo tên file chứa ngày: week_YYYYMMDD.parquet
+        # Sắp xếp theo tên file chứa ngày: week_YYYYMMDD/*.parquet
         key=lambda k: k.split("/")[-1]
     )
     return keys
@@ -242,7 +243,7 @@ def merge_current_batches(**context):
     """
     Task 2: Gộp tất cả batch lẻ của tuần hiện tại thành 1 file parquet tạm.
 
-    File tạm: merged-weekly/week_{date}_temp.parquet
+    File tạm: merged-weekly/week_{date}_temp/*.parquet
     Sau khi training xong, task finalize_weekly_merge đổi tên thành chính thức.
 
     Dùng PySpark để đọc và gộp hiệu quả.
@@ -292,7 +293,7 @@ def merge_current_batches(**context):
         logger.info(f"Total rows in current week: {row_count}")
 
         # Ghi ra file temp trên S3
-        temp_key    = f"{S3_MERGED}/{week_key}_temp.parquet"
+        temp_key    = f"{S3_MERGED}/{week_key}_temp"
         temp_s3path = f"s3a://{S3_BUCKET}/{temp_key}"
 
         df.coalesce(1).write.mode("overwrite").parquet(temp_s3path)
@@ -334,8 +335,10 @@ def run_training(**context):
     logger.info("Loading Kaggle baseline CSV...")
     obj    = s3.get_object(Bucket=S3_BUCKET, Key=S3_BASELINE)
     df_kaggle = pd.read_csv(io.BytesIO(obj["Body"].read()))
-    logger.info(f"Kaggle rows: {len(df_kaggle)}")
-
+    print(f"Kaggle rows: {len(df_kaggle)}")
+    # Normalize label before concat so pd.concat doesn't produce NaN
+    if "Class" in df_kaggle.columns and "is_fraud_label" not in df_kaggle.columns:
+        df_kaggle["is_fraud_label"] = df_kaggle["Class"]
     all_dfs = [df_kaggle]
 
     # ── 2. Load weekly merged files ───────────────────────────────────────
@@ -502,7 +505,7 @@ def finalize_weekly_merge(**context):
     """
     Task 4: Sau khi training thành công, đổi tên file tạm thành file chính thức.
 
-    week_{date}_temp.parquet → week_{date}.parquet
+    week_{date}_temp → week_{date}
 
     Lý do làm sau khi training (không phải trước):
     Nếu training fail, file temp vẫn có thể dùng lại ở lần retry
@@ -522,12 +525,12 @@ def finalize_weekly_merge(**context):
     resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=temp_key)
     objects = resp.get("Contents", [])
 
-    final_prefix = f"{S3_MERGED}/{week_key}.parquet"
+    final_prefix = f"{S3_MERGED}/{week_key}"
 
     for obj in objects:
         old_key = obj["Key"]
         # Đổi prefix từ _temp sang chính thức
-        new_key = old_key.replace(f"{week_key}_temp.parquet", f"{week_key}.parquet")
+        new_key = old_key.replace(f"{week_key}_temp", f"{week_key}")
         # Copy
         s3.copy_object(
             Bucket=S3_BUCKET,

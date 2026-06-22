@@ -47,9 +47,7 @@ S3_FEATURE       = os.environ.get("S3_PREFIX_FEATURE", "feature-store")
 S3_PREDICTION    = os.environ.get("S3_PREFIX_PREDICTION", "prediction")
 S3_DEAD_LETTER   = os.environ.get("S3_PREFIX_DEAD_LETTER", "dead-letter")
 SPARK_JOBS_DIR   = os.environ.get("SPARK_JOBS_DIR")
-API_GATEWAY_URL  = os.environ.get("API_GATEWAY_URL", "")
-API_USERNAME     = os.environ.get("API_GATEWAY_USERNAME", "admin")
-API_PASSWORD     = os.environ.get("API_GATEWAY_PASSWORD", "")
+MODEL_ECS_ENDPOINT  = os.environ.get("MODEL_ECS_ENDPOINT", "")
 AWS_REGION       = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
 
 if SPARK_JOBS_DIR not in sys.path:
@@ -429,7 +427,7 @@ def call_fraud_api(**context):
     Task 8: Gọi API Gateway → Lambda → ECS ML Model.
     - Đọc feature data từ S3
     - DROP cột is_fraud_label trước khi gửi (chỉ dùng cho training)
-    - Gửi từng batch nhỏ tới API
+    - Gửi toàn bộ request body tới API trong một cuộc gọi duy nhất
     - Lưu predictions vào XCom
     """
     ti = context["ti"]
@@ -456,81 +454,41 @@ def call_fraud_api(**context):
     logger.info(f"Calling fraud detection API for {len(inference_df)} transactions")
     logger.info(f"Inference features: {list(inference_df.columns)}")
 
-    # Gọi API theo batch nhỏ 100 records/request
-    api_url    = f"{API_GATEWAY_URL.rstrip('/')}/predict"
-    batch_size = 100
-    total_rows = len(inference_df)
-    total_sent = 0
-    failed_chunks = []
+    api_url = f"{MODEL_ECS_ENDPOINT.rstrip('/')}/predict"
+    payload = build_request_body(inference_df)
 
-    for i in range(0, len(inference_df), batch_size):
-        chunk = inference_df.iloc[i:i + batch_size]
-        chunk_num   = i // batch_size + 1
-        total_chunks = (total_rows + batch_size - 1) // batch_size
+    logger.info(f"Sending request body with {len(payload['request_data'])} rows to {api_url}")
 
-        payload = build_request_body(chunk)
-
-        logger.info(
-            f"Chunk {chunk_num}/{total_chunks}: "
-            f"{len(payload['request_data'])} rows → POST {api_url}"
+    try:
+        resp = requests.post(
+            api_url,
+            json=payload,
+            # auth=(API_USERNAME, API_PASSWORD),
+            timeout=60,
+            headers={"Content-Type": "application/json"},
         )
+        resp.raise_for_status()
 
+        # Log response
         try:
-            resp = requests.post(
-                api_url,
-                json=payload,
-                auth=(API_USERNAME, API_PASSWORD),
-                timeout=60,
-                headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
+            resp_data = resp.json()
+            logger.info(f"API call OK | status: {resp.status_code} | response: {str(resp_data)[:200]}")
+        except Exception:
+            logger.info(f"API call OK | status: {resp.status_code}")
 
-            logger.info(f"  API chunk {i//batch_size + 1}: {len(preds)} predictions")
-            # Log response
-            try:
-                resp_data = resp.json()
-                logger.info(f"Chunk {chunk_num} OK | status: {resp.status_code} | response: {str(resp_data)[:200]}")
-            except Exception:
-                logger.info(f"Chunk {chunk_num} OK | status: {resp.status_code}")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"API call HTTP error: {e} | body: {resp.text[:300] if 'resp' in locals() else ''}")
+        raise RuntimeError(f"API call failed with HTTP error: {e}")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"API call Connection error: {e}")
+        raise RuntimeError(f"API call failed with Connection error: {e}")
+    except requests.exceptions.Timeout as e:
+        logger.error(f"API call Timeout after 60s: {e}")
+        raise RuntimeError(f"API call failed with Timeout: {e}")
+    except Exception as e:
+        logger.error(f"API call Unexpected error: {e}")
+        raise RuntimeError(f"API call failed with unexpected error: {e}")
 
-            total_sent += len(chunk)
-        
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"Chunk {chunk_num} HTTP error: {e} | body: {resp.text[:300]}")
-            failed_chunks.append(chunk_num)
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Chunk {chunk_num} Connection error: {e}")
-            failed_chunks.append(chunk_num)
-        except requests.exceptions.Timeout:
-            logger.error(f"Chunk {chunk_num} Timeout after 60s")
-            failed_chunks.append(chunk_num)
-        except Exception as e:
-            logger.error(f"Chunk {chunk_num} Unexpected error: {e}")
-            failed_chunks.append(chunk_num)
-
-    # ── Tổng kết ──────────────────────────────────────────────────────────
-    total_chunks = (total_rows + batch_size - 1) // batch_size
-    logger.info(
-        f"API call complete: {total_sent}/{total_rows} rows sent | "
-        f"failed chunks: {len(failed_chunks)}/{total_chunks}"
-    )
-
-    # Nếu TẤT CẢ chunks đều fail → raise để Airflow mark task failed
-    if len(failed_chunks) == total_chunks:
-        raise RuntimeError(
-            f"All {total_chunks} API chunks failed. "
-            f"Check API_GATEWAY_URL ({API_GATEWAY_URL}) and credentials."
-        )
-
-    # Nếu một phần fail → warning, không dừng
-    if failed_chunks:
-        logger.warning(f"Partial failure: chunks {failed_chunks} failed")
-        send_alert(
-            subject=f"Test API: Partial failure — batch {batch_id}",
-            message=f"{len(failed_chunks)}/{total_chunks} chunks failed.",
-            level="warning",
-            context={"batch_id": batch_id, "failed_chunks": str(failed_chunks)},
-        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TASK DEFINITIONS
