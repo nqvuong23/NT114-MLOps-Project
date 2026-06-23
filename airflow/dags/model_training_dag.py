@@ -15,12 +15,23 @@ Full Retraining strategy với Weekly Merge:
   → Tránh phải scan hàng ngàn batch folders mỗi lần training
 
 Flow:
-  1. collect_dataset        → Liệt kê weekly merged files + batch lẻ tuần này
-  2. merge_current_batches  → Gộp batch lẻ tuần hiện tại → weekly file tạm
-  3. run_training           → Load Kaggle + weekly files → train XGBoost
-  4. evaluate_and_register  → So sánh F1, đẩy lên MLflow Registry nếu tốt hơn
-  5. finalize_weekly_merge  → Đổi tên file tạm thành file chính thức
-  6. notify                 → Gửi alert kết quả
+  1. collect_dataset          → Liệt kê weekly merged files + batch lẻ tuần này
+  2. merge_current_batches    → Gộp batch lẻ tuần hiện tại → weekly file tạm
+  3. run_training             → Load Kaggle + weekly files → train XGBoost
+  4. create_reference_snapshot→ Nếu model được promote: tạo snapshot 10k rows
+                                làm reference log cho drift detection DAG
+                                (chạy song song với finalize_weekly_merge)
+  5. finalize_weekly_merge    → Đổi tên file tạm thành file chính thức
+  6. notify                   → Gửi alert kết quả
+  7. trigger_codepipeline     → Gọi API Gateway kích hoạt CodePipeline
+
+Reference Snapshot (task 4):
+  - Chỉ chạy khi model mới được promote lên Staging
+  - Load cùng dataset đã dùng để train: Kaggle CSV + weekly files + temp merge
+  - Stratified sample 10 000 rows (giữ nguyên fraud rate)
+  - Upload lên S3:
+      reference-logs/model_{timestamp}_{run_id[:8]}.parquet  (versioned)
+      reference-logs/current_reference.parquet               (luôn là bản mới nhất)
 
 Lưu ý file train_real_data.py gốc của bạn:
   - Đã giữ nguyên logic prepare_features(), Optuna, MLflow tracking
@@ -55,6 +66,7 @@ S3_FEATURE       = os.environ.get("S3_PREFIX_FEATURE", "feature-store")
 S3_TRAINING_DATASET        = os.environ.get("S3_PREFIX_TRAINING_DATASET")           # prefix lưu file gộp theo tuần
 S3_MERGED        = f"{S3_TRAINING_DATASET}/weekly"         
 S3_BASELINE      = f"{S3_TRAINING_DATASET}/baseline/creditcard.csv"
+S3_REFERENCE_LOGS = os.environ.get("S3_PREFIX_REFERENCE_LOGS", "reference-logs")  # prefix for drift reference snapshots
 MLFLOW_URI       = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
 AWS_REGION       = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
 MODEL_NAME       = "CreditCardFraudModel"
@@ -529,6 +541,136 @@ def run_training(**context):
     Variable.set("last_training_f1", str(final_f1))
 
 
+def create_reference_snapshot(**context):
+    """
+    Task 4 (parallel with finalize_weekly_merge): Tạo reference snapshot 10k rows
+    cho drift detection DAG.
+
+    Chỉ chạy khi model mới được promote lên Staging. Nếu không promoted → skip.
+
+    Logic:
+      1. Load cùng dataset đã dùng để train:
+           - Kaggle creditcard.csv (apply feature engineering)
+           - Tất cả weekly merged parquet files
+           - Temp merged file của tuần hiện tại (nếu có)
+      2. Concat → prepare_features()
+      3. Stratified sample 10 000 rows (giữ nguyên fraud rate)
+      4. Upload lên S3:
+           reference-logs/model_{timestamp}_{run_id[:8]}.parquet  (versioned archive)
+           reference-logs/current_reference.parquet               (luôn là bản mới nhất)
+
+    Drift detection DAG sẽ đọc current_reference.parquet làm reference baseline.
+    """
+    ti            = context["ti"]
+    promoted      = ti.xcom_pull(key="promoted",      task_ids="run_training")
+    mlflow_run_id = ti.xcom_pull(key="mlflow_run_id", task_ids="run_training")
+    merged_files  = ti.xcom_pull(key="merged_files",  task_ids="collect_dataset")
+    temp_key      = ti.xcom_pull(key="temp_merged_key", task_ids="merge_current_batches")
+
+    if not promoted:
+        logger.info("Model was not promoted — skipping reference snapshot creation")
+        return
+
+    logger.info("Model promoted → building reference snapshot for drift detection...")
+    s3 = get_s3()
+
+    # ── 1. Load Kaggle baseline ───────────────────────────────────────────────
+    logger.info("Loading Kaggle baseline CSV...")
+    obj       = s3.get_object(Bucket=S3_BUCKET, Key=S3_BASELINE)
+    df_kaggle = pd.read_csv(io.BytesIO(obj["Body"].read()))
+    logger.info(f"Kaggle rows: {len(df_kaggle)}")
+    all_dfs = [df_kaggle]
+
+    # ── 2. Load weekly merged files ───────────────────────────────────────────
+    for s3_key in (merged_files or []):
+        if "_temp" in s3_key:
+            continue
+        try:
+            obj     = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+            df_week = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+            all_dfs.append(df_week)
+            logger.info(f"Loaded weekly file {s3_key}: {len(df_week)} rows")
+        except Exception as e:
+            logger.warning(f"Could not load {s3_key}: {e}")
+
+    # ── 3. Load temp merged file của tuần hiện tại ────────────────────────────
+    if temp_key:
+        try:
+            resp       = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=temp_key)
+            part_files = [
+                o["Key"] for o in resp.get("Contents", [])
+                if o["Key"].endswith(".parquet") and "part-" in o["Key"]
+            ]
+            if part_files:
+                obj        = s3.get_object(Bucket=S3_BUCKET, Key=part_files[0])
+                df_current = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+                all_dfs.append(df_current)
+                logger.info(f"Temp merge rows: {len(df_current)}")
+        except Exception as e:
+            logger.warning(f"Could not load temp merged file: {e}")
+
+    # ── 4. Concat & prepare features ─────────────────────────────────────────
+    df_combined = pd.concat(all_dfs, ignore_index=True)
+    logger.info(f"Combined dataset for snapshot: {len(df_combined)} rows")
+
+    X, y = prepare_features(df_combined)
+    df_snapshot = X.copy()
+    df_snapshot["is_fraud_label"] = y.values
+
+    # ── 5. Stratified sample 10 000 rows (maintain fraud rate) ───────────────
+    SNAPSHOT_SIZE = 10_000
+    if len(df_snapshot) > SNAPSHOT_SIZE:
+        fraud_df   = df_snapshot[df_snapshot["is_fraud_label"] == 1]
+        normal_df  = df_snapshot[df_snapshot["is_fraud_label"] == 0]
+        fraud_rate = len(fraud_df) / len(df_snapshot)
+
+        n_fraud  = max(1, int(SNAPSHOT_SIZE * fraud_rate))
+        n_normal = SNAPSHOT_SIZE - n_fraud
+
+        fraud_sample  = fraud_df.sample(n=min(n_fraud,  len(fraud_df)),  random_state=42)
+        normal_sample = normal_df.sample(n=min(n_normal, len(normal_df)), random_state=42)
+
+        df_snapshot = pd.concat([fraud_sample, normal_sample], ignore_index=True)
+        df_snapshot = df_snapshot.sample(frac=1, random_state=42).reset_index(drop=True)
+        logger.info(
+            f"Stratified sample: {len(df_snapshot)} rows "
+            f"(fraud: {fraud_sample.shape[0]}, normal: {normal_sample.shape[0]})"
+        )
+    else:
+        logger.info(f"Dataset smaller than {SNAPSHOT_SIZE} — using full dataset as snapshot")
+
+    # ── 6. Upload to S3 ───────────────────────────────────────────────────────
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id_short = (mlflow_run_id or "unknown")[:8]
+
+    buf = io.BytesIO()
+    df_snapshot.to_parquet(buf, index=False, engine="pyarrow")
+    parquet_bytes = buf.getvalue()
+
+    # Versioned archive file
+    versioned_key = f"{S3_REFERENCE_LOGS}/model_{timestamp}_{run_id_short}.parquet"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=versioned_key,
+        Body=parquet_bytes,
+        ContentType="application/octet-stream",
+    )
+    logger.info(f"Versioned reference snapshot uploaded: s3://{S3_BUCKET}/{versioned_key}")
+
+    # current_reference.parquet — always points to the latest promoted model's snapshot
+    current_key = f"{S3_REFERENCE_LOGS}/current_reference.parquet"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=current_key,
+        Body=parquet_bytes,
+        ContentType="application/octet-stream",
+    )
+    logger.info(f"current_reference.parquet updated: s3://{S3_BUCKET}/{current_key}")
+
+    ti.xcom_push(key="reference_snapshot_key", value=versioned_key)
+    ti.xcom_push(key="reference_snapshot_rows", value=len(df_snapshot))
+
+
 def finalize_weekly_merge(**context):
     """
     Task 4: Xử lý file merge tạm sau khi training thành công.
@@ -634,6 +776,13 @@ def trigger_codepipeline(**context):
     Gửi POST request với empty body đến API_GATEWAY_URL.
     Request chỉ mang tính tín hiệu (signal) — không cần payload.
     """
+    ti            = context["ti"]
+    promoted      = ti.xcom_pull(key="promoted",      task_ids="run_training")
+    
+    if not promoted:
+        logger.info("Model was not promoted — skipping trigger CodePipeline")
+        return
+    
     api_url = API_GATEWAY_URL
     if not api_url:
         raise ValueError(
@@ -664,13 +813,16 @@ def trigger_codepipeline(**context):
 
 # ── Task Definitions ──────────────────────────────────────────────────────────
 with dag:
-    t1_collect  = PythonOperator(task_id="collect_dataset",       python_callable=collect_dataset)
-    t2_merge    = PythonOperator(task_id="merge_current_batches", python_callable=merge_current_batches,
-                                 execution_timeout=timedelta(hours=1))
-    t3_train    = PythonOperator(task_id="run_training",          python_callable=run_training,
-                                 execution_timeout=timedelta(hours=3))
-    t4_finalize = PythonOperator(task_id="finalize_weekly_merge", python_callable=finalize_weekly_merge)
-    t5_notify   = PythonOperator(task_id="notify",                python_callable=notify)
-    t6_pipeline = PythonOperator(task_id="trigger_codepipeline",  python_callable=trigger_codepipeline)
+    t1_collect    = PythonOperator(task_id="collect_dataset",          python_callable=collect_dataset)
+    t2_merge      = PythonOperator(task_id="merge_current_batches",    python_callable=merge_current_batches,
+                                   execution_timeout=timedelta(hours=1))
+    t3_train      = PythonOperator(task_id="run_training",             python_callable=run_training,
+                                   execution_timeout=timedelta(hours=3))
+    t4_ref_snap   = PythonOperator(task_id="create_reference_snapshot", python_callable=create_reference_snapshot,
+                                   execution_timeout=timedelta(minutes=30))
+    t4_finalize   = PythonOperator(task_id="finalize_weekly_merge",    python_callable=finalize_weekly_merge)
+    t5_notify     = PythonOperator(task_id="notify",                   python_callable=notify)
+    t6_pipeline   = PythonOperator(task_id="trigger_codepipeline",     python_callable=trigger_codepipeline)
 
-    t1_collect >> t2_merge >> t3_train >> t4_finalize >> t5_notify >> t6_pipeline
+    # create_reference_snapshot runs in parallel with finalize_weekly_merge after training
+    t1_collect >> t2_merge >> t3_train >> [t4_ref_snap, t4_finalize] >> t5_notify >> t6_pipeline

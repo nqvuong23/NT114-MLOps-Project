@@ -6,12 +6,23 @@ DAG 2: Drift Detection với Evidently AI.
 Schedule: Hàng ngày lúc 6 giờ sáng
 
 Flow:
-  1. load_reference_data   → Load Kaggle CSV làm reference (baseline)
+  1. load_reference_data   → Đọc current_reference.parquet từ S3
+                             (snapshot 10k rows được tạo bởi model_training_dag
+                              sau mỗi lần model mới được promote)
   2. load_inference_logs   → Gộp /prediction/*.parquet của 7 ngày gần nhất
   3. run_drift_detection   → Chạy Evidently: data drift + prediction drift
   4. save_report           → Lưu HTML report lên S3
   5. evaluate_drift        → So sánh drift score với ngưỡng định nghĩa sẵn
   6. trigger_retraining    → Nếu drift → gọi Airflow REST API trigger DAG training
+
+Reference log là training snapshot của phiên bản model mới nhất:
+  - Bao gồm: Kaggle creditcard.csv + tất cả weekly merge files + temp merge của tuần hiện tại
+  - Đã được feature-engineer để cùng schema với inference logs
+  - Stratified sample 10 000 rows (để giữ nguyên fraud rate)
+  - Được upload bởi task create_reference_snapshot trong model_training_dag
+    sau mỗi lần promote model mới:
+      s3://bucket/reference-logs/model_{timestamp}_{run_id[:8]}.parquet  (versioned)
+      s3://bucket/reference-logs/current_reference.parquet               (latest)
 
 Hai loại drift được detect:
   - Data Drift    : distribution của input features (V1-V28, amount...) thay đổi
@@ -46,7 +57,8 @@ logger = logging.getLogger(__name__)
 S3_BUCKET        = os.environ.get("S3_BUCKET_NAME", "")
 S3_PREDICTION    = os.environ.get("S3_PREFIX_PREDICTION", "prediction")
 S3_TRAINING_DATASET        = os.environ.get("S3_PREFIX_TRAINING_DATASET")
-S3_BASELINE      = f"{S3_TRAINING_DATASET}/baseline/creditcard.csv"
+S3_REFERENCE_LOGS = os.environ.get("S3_PREFIX_REFERENCE_LOGS", "reference-logs")  # prefix where training DAG writes snapshots
+S3_CURRENT_REFERENCE = f"{S3_REFERENCE_LOGS}/current_reference.parquet"           # always points to latest promoted model snapshot
 S3_DRIFT_REPORTS = os.environ.get("S3_PREFIX_DRIFT_REPORTS")
 AWS_REGION       = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
 AIRFLOW_API_BASE = os.environ.get("AIRFLOW_API_URL", "http://airflow-apiserver:8080")
@@ -95,63 +107,51 @@ def get_s3() -> boto3.client:
     return boto3.client("s3", region_name=AWS_REGION)
 
 
-def prepare_reference_features(df_kaggle: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply feature engineering lên Kaggle CSV để có cùng schema
-    với inference logs từ feature-store.
-    """
-    import numpy as np
-
-    df = df_kaggle.copy()
-    df["hour_of_day"]       = (df["Time"] // 3600) % 24
-    df["is_night_hour"]     = df["hour_of_day"].isin([22,23,0,1,2,3,4]).astype(int)
-    df["amount_log1p"]      = np.log1p(df["Amount"])
-    amount_mean             = df["Amount"].mean()
-    amount_std              = df["Amount"].std()
-    df["amount_normalized"] = (df["Amount"] - amount_mean) / (amount_std or 1.0)
-    df["amount_zscore"]     = df["amount_normalized"]
-    times     = df["Time"].values
-    start_idx = __import__("numpy").searchsorted(times, times - 3600, side="left")
-    df["tx_count_1h"]    = (__import__("numpy").arange(len(times)) - start_idx + 1).astype(int)
-    df["is_high_amount"] = (df["Amount"] > 500).astype(int)
-    df["is_international"] = 0
-    df["amount"]           = df["Amount"]
-    # Label
-    df["is_fraud_label"] = df["Class"]
-
-    return df
-
-
 # ── Task Functions ─────────────────────────────────────────────────────────────
 
 def load_reference_data(**context):
     """
-    Task 1: Load Kaggle CSV từ S3 làm reference dataset.
-    Apply feature engineering để cùng schema với inference logs.
-    Lấy sample 10k rows để Evidently chạy nhanh hơn.
+    Task 1: Đọc current_reference.parquet từ S3 làm reference dataset.
+
+    File này được tạo bởi task create_reference_snapshot trong model_training_dag
+    mỗi khi có model mới được promote lên Staging. Nó là stratified sample
+    10 000 rows từ toàn bộ dữ liệu training (Kaggle CSV + tất cả weekly merge
+    files + temp merge file của tuần hiện tại), đã được feature-engineer.
+
+    Nếu current_reference.parquet chưa tồn tại (ví dụ: chưa có model nào được
+    promote), task sẽ cảnh báo và đặt has_reference=False để bỏ qua drift
+    detection một cách an toàn.
     """
     s3 = get_s3()
 
-    logger.info(f"Loading reference data from s3://{S3_BUCKET}/{S3_BASELINE}")
-    obj      = s3.get_object(Bucket=S3_BUCKET, Key=S3_BASELINE)
-    df_kaggle = pd.read_csv(io.BytesIO(obj["Body"].read()))
-    logger.info(f"Kaggle rows: {len(df_kaggle)}")
+    logger.info(f"Loading reference snapshot from s3://{S3_BUCKET}/{S3_CURRENT_REFERENCE}")
+    try:
+        obj    = s3.get_object(Bucket=S3_BUCKET, Key=S3_CURRENT_REFERENCE)
+        df_ref = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    except s3.exceptions.NoSuchKey:
+        logger.warning(
+            f"current_reference.parquet not found at s3://{S3_BUCKET}/{S3_CURRENT_REFERENCE}. "
+            "No model has been promoted yet. Skipping drift detection for this run."
+        )
+        context["ti"].xcom_push(key="reference_json", value=None)
+        context["ti"].xcom_push(key="reference_rows", value=0)
+        context["ti"].xcom_push(key="has_reference",  value=False)
+        return
+    except Exception as e:
+        logger.error(f"Failed to load reference snapshot: {e}")
+        raise
 
-    # Apply feature engineering
-    df_ref = prepare_reference_features(df_kaggle)
+    logger.info(f"Reference snapshot loaded: {len(df_ref)} rows")
 
-    # Lấy sample để đại diện (Evidently không cần toàn bộ 284k rows)
-    sample_size = min(10000, len(df_ref))
-    df_ref_sample = df_ref.sample(n=sample_size, random_state=42)
+    # Align to expected feature columns + label (snapshot is already feature-engineered)
+    available_feat = [c for c in FEATURE_COLS if c in df_ref.columns]
+    keep_cols      = available_feat + [c for c in ["is_fraud_label"] if c in df_ref.columns]
+    df_ref_out     = df_ref[keep_cols].reset_index(drop=True)
 
-    # Chọn feature columns + label
-    available_feat = [c for c in FEATURE_COLS if c in df_ref_sample.columns]
-    df_ref_out = df_ref_sample[available_feat + ["is_fraud_label"]].reset_index(drop=True)
-
-    # Lưu vào XCom dưới dạng JSON (size nhỏ vì đã sample)
     context["ti"].xcom_push(key="reference_json", value=df_ref_out.to_json(orient="records"))
     context["ti"].xcom_push(key="reference_rows", value=len(df_ref_out))
-    logger.info(f"Reference sample: {len(df_ref_out)} rows")
+    context["ti"].xcom_push(key="has_reference",  value=True)
+    logger.info(f"Reference features: {len(available_feat)} cols | rows: {len(df_ref_out)}")
 
 
 def load_inference_logs(**context):
@@ -268,9 +268,18 @@ def run_drift_detection(**context):
     )
 
     ti = context["ti"]
-    has_data      = ti.xcom_pull(key="has_data",        task_ids="load_inference_logs")
-    ref_json      = ti.xcom_pull(key="reference_json",  task_ids="load_reference_data")
-    current_json  = ti.xcom_pull(key="current_json",    task_ids="load_inference_logs")
+    has_data      = ti.xcom_pull(key="has_data",       task_ids="load_inference_logs")
+    has_reference = ti.xcom_pull(key="has_reference",  task_ids="load_reference_data")
+    ref_json      = ti.xcom_pull(key="reference_json", task_ids="load_reference_data")
+    current_json  = ti.xcom_pull(key="current_json",   task_ids="load_inference_logs")
+
+    if not has_reference or not ref_json:
+        logger.warning("No reference snapshot available — skipping drift detection")
+        ti.xcom_push(key="drift_detected",      value=False)
+        ti.xcom_push(key="data_drift_score",    value=0.0)
+        ti.xcom_push(key="pred_drift_detected", value=False)
+        ti.xcom_push(key="drift_summary",       value="No reference data")
+        return
 
     if not has_data or not current_json:
         logger.warning("No current data to compare — skipping drift detection")

@@ -67,7 +67,12 @@ def _run_checkpoint(df: pd.DataFrame, suite_name: str, expectations_fn) -> Tuple
     checkpoint = context.checkpoints.add(
         gx.Checkpoint(
             name=f"{suite_name}_checkpoint",
-            validation_definitions=[validation_definition]
+            validation_definitions=[validation_definition],
+            result_format={
+                "result_format": "COMPLETE",
+                "partial_unexpected_count": len(df),   # trả về tối đa = số row của batch
+                "include_unexpected_rows": False,       # không cần raw rows, chỉ cần index
+            },
         )
     )
     

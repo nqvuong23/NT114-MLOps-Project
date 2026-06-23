@@ -130,6 +130,121 @@ def write_dead_letter(df: pd.DataFrame, batch_id: str, step: str, reason: str):
     s3.put_object(Bucket=S3_BUCKET, Key=reason_key, Body=reason.encode())
     logger.warning(f"Dead letter written: s3://{S3_BUCKET}/{key}")
 
+
+def clear_s3_prefix(prefix: str):
+    """
+    Xoá toàn bộ object nằm dưới một S3 prefix (xử lý output dạng thư mục
+    của PySpark như _SUCCESS, part-00000.parquet, part-00001.parquet, ...).
+
+    Args:
+        prefix: S3 key prefix không có s3://bucket/, ví dụ:
+                "processed-data/20250101_120000/"
+    """
+    s3 = get_s3_client()
+    # Đảm bảo prefix kết thúc bằng '/' để tránh xoá nhầm key khác
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
+
+    paginator = s3.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
+
+    keys_to_delete = []
+    for page in pages:
+        for obj in page.get("Contents", []):
+            keys_to_delete.append({"Key": obj["Key"]})
+
+    if not keys_to_delete:
+        logger.info(f"clear_s3_prefix: no objects found under s3://{S3_BUCKET}/{prefix}")
+        return
+
+    # S3 delete_objects hỗ trợ tối đa 1000 key mỗi lần
+    for i in range(0, len(keys_to_delete), 1000):
+        batch = keys_to_delete[i : i + 1000]
+        s3.delete_objects(Bucket=S3_BUCKET, Delete={"Objects": batch})
+
+    logger.info(
+        f"clear_s3_prefix: deleted {len(keys_to_delete)} objects "
+        f"from s3://{S3_BUCKET}/{prefix}"
+    )
+
+
+def extract_failed_indices(result: dict) -> set:
+    """
+    Trích xuất tập hợp các row index bị lỗi từ kết quả GE validation.
+
+    GE lưu các index lỗi trong trường "partial_unexpected_index_list" bên trong
+    chuỗi "result" của mỗi failed expectation.  Hàm này parse chuỗi đó
+    (hoặc dict nếu đã được deserialize) và gộp tất cả index lại thành một set.
+
+    Lưu ý: GE chỉ trả về partial_unexpected_index_list (mặc định ≤ 20 phần tử).
+    Với batch nhỏ (< 5 phút), danh sách này thường đủ để xác định toàn bộ row lỗi.
+    """
+    import ast
+    failed_indices: set = set()
+
+    for exp in result.get("failed_expectations", []):
+        raw_result = exp.get("result", {})
+
+        # Nếu kết quả đã là dict thì dùng trực tiếp, ngược lại parse string
+        if isinstance(raw_result, str):
+            try:
+                parsed = ast.literal_eval(raw_result)
+            except (ValueError, SyntaxError):
+                logger.warning(
+                    f"Cannot parse result string for expectation "
+                    f"'{exp.get('expectation_type')}' on column '{exp.get('column')}'"
+                )
+                continue
+        else:
+            parsed = raw_result
+
+        # Ưu tiên lấy partial_unexpected_index_list
+        idx_list = parsed.get("partial_unexpected_index_list", [])
+        if idx_list:
+            failed_indices.update(idx_list)
+            continue
+
+        # Fallback: unexpected_index_list (đầy đủ, nếu GE trả về)
+        full_idx_list = parsed.get("unexpected_index_list", [])
+        if full_idx_list:
+            failed_indices.update(full_idx_list)
+
+    return failed_indices
+
+
+def split_by_validation(
+    df: pd.DataFrame,
+    result: dict,
+) -> tuple:
+    """
+    Tách DataFrame thành 2 phần dựa trên kết quả GE validation:
+      - passed_df : các row PASS (không xuất hiện trong danh sách lỗi)
+      - failed_df : các row FAIL (index nằm trong partial_unexpected_index_list)
+
+    Trả về (passed_df, failed_df).
+    """
+    failed_indices = extract_failed_indices(result)
+
+    if not failed_indices:
+        # Không tìm được index cụ thể → toàn bộ df pass (hoặc lỗi table-level)
+        logger.warning(
+            "No row-level failed indices found in validation result. "
+            "Treating all rows as passed (check for table-level expectations)."
+        )
+        return df.copy(), pd.DataFrame(columns=df.columns)
+
+    # Lọc theo positional index (iloc) — GE trả về integer position
+    valid_positions = [i for i in failed_indices if i < len(df)]
+    failed_df = df.iloc[sorted(valid_positions)].copy()
+    passed_mask = ~df.index.isin(df.iloc[sorted(valid_positions)].index)
+    passed_df = df[passed_mask].copy()
+
+    logger.info(
+        f"Row split: {len(passed_df)} passed, {len(failed_df)} failed "
+        f"(from {len(df)} total)"
+    )
+    return passed_df, failed_df
+
 def build_request_body(df: pd.DataFrame, limit: int = None) -> dict:
     """
     Chuyển DataFrame thành request body đúng format model.
@@ -249,7 +364,16 @@ def save_raw_to_s3(**context):
 
 
 def validate_raw(**context):
-    """Task 3: Great Expectations validate raw data."""
+    """
+    Task 3: Great Expectations validate raw data.
+
+    Thay vì raise lỗi khi validation fail, task này:
+      1. Chạy GE validation trên toàn bộ DataFrame
+      2. Tách các row bị lỗi (dựa vào partial_unexpected_index_list trong result)
+      3. Upload passed rows trở lại S3 tại cùng đường dẫn raw.parquet
+      4. Upload failed rows + reason.txt vào dead-letter trên S3
+      5. Pipeline LUÔN tiếp tục (không raise exception)
+    """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
@@ -257,27 +381,58 @@ def validate_raw(**context):
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
-    import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet"
+    s3_key = f"{S3_RAW}/{batch_id}/raw.parquet"
+    s3_path = f"s3://{S3_BUCKET}/{s3_key}"
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:
         raise RuntimeError(f"Cannot read raw data from S3: {e}")
-    
+
     from ge_validations import validate_raw_data, log_validation_result
     passed, result = validate_raw_data(df)
     log_validation_result(result, "raw_data")
 
     if not passed:
-        write_dead_letter(df, batch_id, "raw_validation", json.dumps(result))
+        # ── Tách row pass / fail ──────────────────────────────────────────
+        passed_df, failed_df = split_by_validation(df, result)
+
+        # ── Ghi failed rows vào dead-letter ──────────────────────────────
+        if len(failed_df) > 0:
+            reason = (
+                f"Raw validation failed: {result['failed_count']} expectations failed.\n"
+                + json.dumps(result, indent=2)
+            )
+            write_dead_letter(failed_df, batch_id, "raw_validation", reason)
+        else:
+            # Không có row cụ thể nào fail (ví dụ table-level expectation)
+            # → Ghi toàn bộ df vào dead-letter để không mất dữ liệu
+            reason = (
+                f"Raw validation failed (table-level): {result['failed_count']} expectations failed.\n"
+                + json.dumps(result, indent=2)
+            )
+            write_dead_letter(df, batch_id, "raw_validation", reason)
+            passed_df = df  # giữ nguyên tất cả để pipeline tiếp tục
+
+        # ── Overwrite S3 với passed rows ──────────────────────────────────
+        upload_parquet_to_s3(passed_df, s3_key)
+        logger.info(
+            f"validate_raw: {len(passed_df)} passed rows re-uploaded to {s3_path}, "
+            f"{len(failed_df)} failed rows sent to dead-letter."
+        )
+
         send_alert(
-            subject=f"Raw Validation FAILED — batch {batch_id}",
-            message=f"Great Expectations failed for raw data.\n{json.dumps(result, indent=2)}",
-            level="error",
+            subject=f"Raw Validation PARTIAL FAIL — batch {batch_id}",
+            message=(
+                f"Great Expectations failed for {result['failed_count']} expectations.\n"
+                f"{len(failed_df)} rows moved to dead-letter, "
+                f"{len(passed_df)} rows continue in pipeline.\n"
+                + json.dumps(result, indent=2)
+            ),
+            level="warning",
             context={"batch_id": batch_id, "failed": result["failed_count"]}
         )
-        # Raise exception để Airflow mark task failed và retry
-        raise ValueError(f"Raw data validation failed: {result['failed_count']} expectations failed")
+    else:
+        logger.info(f"validate_raw: All {len(df)} rows passed validation.")
 
 
 def run_spark_cleaning(**context):
@@ -319,7 +474,16 @@ def run_spark_cleaning(**context):
 
 
 def validate_processed(**context):
-    """Task 5: Great Expectations validate processed data."""
+    """
+    Task 5: Great Expectations validate processed data.
+
+    Thay vì raise lỗi khi validation fail, task này:
+      1. Chạy GE validation trên toàn bộ DataFrame
+      2. Tách các row bị lỗi (dựa vào partial_unexpected_index_list trong result)
+      3. Upload passed rows trở lại S3 tại cùng thư mục processed
+      4. Upload failed rows + reason.txt vào dead-letter trên S3
+      5. Pipeline LUÔN tiếp tục (không raise exception)
+    """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
@@ -327,8 +491,10 @@ def validate_processed(**context):
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
-    import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/"
+    # PySpark ghi output dạng thư mục: _SUCCESS + part-*.parquet
+    # → đọc cả thư mục, pandas tự ghép các part file lại
+    s3_prefix = f"{S3_PROCESSED}/{batch_id}/"
+    s3_path = f"s3://{S3_BUCKET}/{s3_prefix}"
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:
@@ -339,14 +505,51 @@ def validate_processed(**context):
     log_validation_result(result, "processed_data")
 
     if not passed:
-        write_dead_letter(df, batch_id, "processed_validation", json.dumps(result))
+        # ── Tách row pass / fail ──────────────────────────────────────────
+        passed_df, failed_df = split_by_validation(df, result)
+
+        # ── Ghi failed rows vào dead-letter ──────────────────────────────
+        if len(failed_df) > 0:
+            reason = (
+                f"Processed validation failed: {result['failed_count']} expectations failed.\n"
+                + json.dumps(result, indent=2)
+            )
+            write_dead_letter(failed_df, batch_id, "processed_validation", reason)
+        else:
+            reason = (
+                f"Processed validation failed (table-level): {result['failed_count']} expectations failed.\n"
+                + json.dumps(result, indent=2)
+            )
+            write_dead_letter(df, batch_id, "processed_validation", reason)
+            passed_df = df
+
+        # ── Xoá toàn bộ Spark part-files cũ rồi upload lại passed rows ───
+        # Cần xoá trước vì Spark tạo nhiều file (part-*.parquet, _SUCCESS, ...)
+        # → upload đè 1 key mới sẽ KHÔNG xoá các file cũ còn lại
+        clear_s3_prefix(s3_prefix)
+        # Dùng tên part-00000.parquet để Spark downstream vẫn đọc được
+        # thư mục như một Parquet dataset bình thường
+        clean_key = f"{s3_prefix}part-00000.parquet"
+        upload_parquet_to_s3(passed_df, clean_key)
+        logger.info(
+            f"validate_processed: {len(passed_df)} passed rows re-uploaded to "
+            f"s3://{S3_BUCKET}/{clean_key}, "
+            f"{len(failed_df)} failed rows sent to dead-letter."
+        )
+
         send_alert(
-            subject=f"Processed Validation FAILED — batch {batch_id}",
-            message=json.dumps(result, indent=2),
-            level="error",
+            subject=f"Processed Validation PARTIAL FAIL — batch {batch_id}",
+            message=(
+                f"Great Expectations failed for {result['failed_count']} expectations.\n"
+                f"{len(failed_df)} rows moved to dead-letter, "
+                f"{len(passed_df)} rows continue in pipeline.\n"
+                + json.dumps(result, indent=2)
+            ),
+            level="warning",
             context={"batch_id": batch_id}
         )
-        raise ValueError(f"Processed data validation failed")
+    else:
+        logger.info(f"validate_processed: All {len(df)} rows passed validation.")
 
 
 def run_spark_features(**context):
@@ -390,7 +593,16 @@ def run_spark_features(**context):
 
 
 def validate_features(**context):
-    """Task 7: Great Expectations validate feature dataset."""
+    """
+    Task 7: Great Expectations validate feature dataset.
+
+    Thay vì ghi toàn bộ df vào dead-letter khi validation fail, task này:
+      1. Chạy GE validation trên toàn bộ DataFrame
+      2. Tách các row bị lỗi (dựa vào partial_unexpected_index_list trong result)
+      3. Upload passed rows trở lại S3 tại cùng thư mục feature-store
+      4. Upload failed rows + reason.txt vào dead-letter trên S3
+      5. Pipeline LUÔN tiếp tục (không raise exception)
+    """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
@@ -398,8 +610,10 @@ def validate_features(**context):
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
-    import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/"
+    # PySpark ghi output dạng thư mục: _SUCCESS + part-*.parquet
+    # → đọc cả thư mục, pandas tự ghép các part file lại
+    s3_prefix = f"{S3_FEATURE}/{batch_id}/"
+    s3_path = f"s3://{S3_BUCKET}/{s3_prefix}"
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:
@@ -410,16 +624,55 @@ def validate_features(**context):
     log_validation_result(result, "features")
 
     if not passed:
-        write_dead_letter(df, batch_id, "feature_validation", json.dumps(result))
+        # ── Tách row pass / fail ──────────────────────────────────────────
+        passed_df, failed_df = split_by_validation(df, result)
+
+        # ── Ghi failed rows vào dead-letter ──────────────────────────────
+        if len(failed_df) > 0:
+            reason = (
+                f"Feature validation failed: {result['failed_count']} expectations failed.\n"
+                + json.dumps(result, indent=2)
+            )
+            write_dead_letter(failed_df, batch_id, "feature_validation", reason)
+        else:
+            reason = (
+                f"Feature validation failed (table-level): {result['failed_count']} expectations failed.\n"
+                + json.dumps(result, indent=2)
+            )
+            write_dead_letter(df, batch_id, "feature_validation", reason)
+            passed_df = df
+
+        # ── Xoá toàn bộ Spark part-files cũ rồi upload lại passed rows ───
+        # Cần xoá trước vì Spark tạo nhiều file (part-*.parquet, _SUCCESS, ...)
+        # → upload đè 1 key mới sẽ KHÔNG xoá các file cũ còn lại
+        clear_s3_prefix(s3_prefix)
+        # Dùng tên part-00000.parquet để call_fraud_api downstream vẫn đọc được
+        # thư mục như một Parquet dataset bình thường
+        clean_key = f"{s3_prefix}part-00000.parquet"
+        upload_parquet_to_s3(passed_df, clean_key)
+        logger.info(
+            f"validate_features: {len(passed_df)} passed rows re-uploaded to "
+            f"s3://{S3_BUCKET}/{clean_key}, "
+            f"{len(failed_df)} failed rows sent to dead-letter."
+        )
+
         send_alert(
-            subject=f"Feature Validation FAILED — batch {batch_id}",
-            message=json.dumps(result, indent=2),
-            level="warning",   # warning, không phải error — pipeline vẫn tiếp tục
+            subject=f"Feature Validation PARTIAL FAIL — batch {batch_id}",
+            message=(
+                f"Great Expectations failed for {result['failed_count']} expectations.\n"
+                f"{len(failed_df)} rows moved to dead-letter, "
+                f"{len(passed_df)} rows continue in pipeline.\n"
+                + json.dumps(result, indent=2)
+            ),
+            level="warning",
             context={"batch_id": batch_id}
         )
-        # Feature validation fail → alert nhưng KHÔNG dừng pipeline
-        # (theo yêu cầu: chỉ alert, không stop)
-        logger.warning("Feature validation failed but pipeline continues (non-blocking)")
+        logger.warning(
+            f"Feature validation failed but pipeline continues — "
+            f"{len(passed_df)} clean rows forwarded to call_fraud_api."
+        )
+    else:
+        logger.info(f"validate_features: All {len(df)} rows passed validation.")
 
 
 def call_fraud_api(**context):
