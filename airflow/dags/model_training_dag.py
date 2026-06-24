@@ -74,7 +74,7 @@ AIRFLOW_API_BASE = os.environ.get("AIRFLOW_API_URL", "http://localhost:8080")
 API_GATEWAY_URL = os.environ.get("API_GATEWAY_URL")
 
 # Ngưỡng F1 để promote model mới lên Staging
-PROMOTION_DELTA  = os.environ.get("PROMOTION_DELTA")   # model mới phải tốt hơn ít nhất 0.01
+PROMOTION_DELTA  = float(os.environ.get("PROMOTION_DELTA"))   # model mới phải tốt hơn ít nhất 0.01
 
 FEATURE_COLS = (
     ["amount", "amount_normalized", "amount_log1p", "amount_zscore",
