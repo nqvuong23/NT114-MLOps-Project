@@ -156,13 +156,15 @@ def load_reference_data(**context):
 
 def load_inference_logs(**context):
     """
-    Task 2: Gộp các file /prediction/*.parquet của 7 ngày gần nhất.
+    Task 2: Gộp các file /prediction/*.xlsx của 7 ngày gần nhất.
 
     File prediction có schema:
       transaction_id, batch_id, predicted_fraud, prediction_timestamp
 
     Cần join với feature data từ feature-store để có input features.
     → Lấy feature data từ các batch_id tương ứng trong feature-store.
+
+    Note: prediction files are Excel (.xlsx); requires openpyxl installed.
     """
     s3          = get_s3()
     cutoff_time = datetime.now(tz=timezone.utc) - timedelta(days=LOOKBACK_DAYS)
@@ -174,7 +176,7 @@ def load_inference_logs(**context):
     recent_keys = []
     for page in pages:
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet") and obj["LastModified"] >= cutoff_time:
+            if obj["Key"].endswith(".xlsx") and obj["LastModified"] >= cutoff_time:
                 recent_keys.append(obj["Key"])
 
     if not recent_keys:
@@ -191,7 +193,7 @@ def load_inference_logs(**context):
     for key in recent_keys:
         try:
             obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-            df  = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+            df  = pd.read_excel(io.BytesIO(obj["Body"].read()))
             pred_dfs.append(df)
         except Exception as e:
             logger.warning(f"Could not load {key}: {e}")
@@ -440,7 +442,18 @@ def evaluate_and_alert(**context):
     data_score     = ti.xcom_pull(key="data_drift_score",    task_ids="run_drift_detection")
     pred_drift     = ti.xcom_pull(key="pred_drift_detected", task_ids="run_drift_detection")
 
-    summary = json.loads(drift_summary) if drift_summary else {}
+    # drift_summary may be a plain string (e.g. "No data") when detection was skipped,
+    # so guard against JSONDecodeError before parsing.
+    try:
+        summary = json.loads(drift_summary) if drift_summary else {}
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(f"drift_summary is not valid JSON (value={drift_summary!r}); treating as empty.")
+        summary = {}
+
+    # Guard against None when run_drift_detection was skipped entirely
+    data_score     = data_score     if data_score     is not None else 0.0
+    pred_drift     = pred_drift     if pred_drift     is not None else False
+    drift_detected = drift_detected if drift_detected is not None else False
 
     if drift_detected:
         send_alert(
