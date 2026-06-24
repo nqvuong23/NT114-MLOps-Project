@@ -34,7 +34,9 @@ from psycopg2.extras import execute_batch
 from datetime import datetime, timezone
 import argparse
 import logging
+from dotenv import load_dotenv
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -134,7 +136,7 @@ def generate_transaction(base_time: datetime) -> dict:
 def get_db_connection():
     return psycopg2.connect(
         host=os.environ["RDS_HOST"],
-        port=int(os.environ.get("RDS_PORT", 5432)),
+        port=int(os.environ["RDS_PORT"]),
         database=os.environ["RDS_TRANSACTIONS_DB"],
         user=os.environ["RDS_USER"],
         password=os.environ["RDS_PASSWORD"],
@@ -212,6 +214,10 @@ def main(n: int, batch_seconds: int = 300):
     try:
         setup_table(conn)
         insert_transactions(conn, transactions)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*), SUM(is_fraud_label) FROM transactions;")
+            total, frauds = cur.fetchone()
+            print(f"Total: {total} | Frauds: {frauds} ({frauds/total*100:.3f}%)")
     finally:
         conn.close()
 

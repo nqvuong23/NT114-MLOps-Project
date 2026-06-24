@@ -4,22 +4,30 @@ fraud_detection_pipeline.py
 Airflow DAG chính: Batch Preprocessing Pipeline cho Fraud Detection MLOps.
 
 Schedule: Chạy mỗi 5 phút
-Flow:
-  1. extract_from_rds       → Lấy batch data từ RDS PostgreSQL
-  2. save_raw_to_s3         → Lưu raw data vào S3 /raw-data/
-  3. validate_raw           → Great Expectations validate raw
-  4. run_spark_cleaning     → Spark cleaning & transformation
-  5. validate_processed     → Great Expectations validate processed
-  6. run_spark_features     → Spark feature engineering
-  7. validate_features      → Great Expectations validate features
-  8. call_fraud_api         → Gọi API Gateway → Lambda → ECS Model
+Flow (refactored — deferred S3 upload):
+  1. extract_from_rds       → Lấy batch data từ RDS PostgreSQL (push raw DF via XCom)
+  2. validate_raw           → Great Expectations validate raw (reads XCom, push passed DF)
+  3. save_raw_to_s3         → Upload passed raw DF lên S3 /raw-data/ via PySpark
+  4. run_spark_cleaning     → Spark cleaning & transformation (reads S3, returns DF via XCom)
+  5. validate_processed     → Great Expectations validate processed (reads XCom, push passed DF)
+  6. save_processed_to_s3   → Upload passed processed DF lên S3 /processed-data/ via PySpark
+  7. run_spark_features     → Spark feature engineering (reads S3, returns DF via XCom)
+  8. validate_features      → Great Expectations validate features (reads XCom, push passed DF)
+  9. save_features_to_s3    → Upload passed features DF lên S3 /feature-store/ via PySpark
+  10. call_fraud_api        → Gọi API Gateway → Lambda → ECS Model
+
+Rationale:
+  - Upload lên S3 chỉ xảy ra MỘT LẦN sau mỗi bước validate,
+    không còn upload → đọc lại → clear_s3_prefix → upload đè.
+  - clear_s3_prefix() không còn cần thiết và đã bị loại bỏ.
+  - Khi validation fail: split_by_validation vẫn tách passed/failed rows,
+    failed rows → dead-letter S3, passed rows push tiếp XCom → upload.
 """
 
 import os
 import json
 import logging
-import subprocess
-import tempfile
+import io
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -69,7 +77,7 @@ default_args = {
 # ── DAG Definition ────────────────────────────────────────────────────────────
 dag = DAG(
     dag_id="fraud_detection_preprocessing",
-    description="Batch preprocessing pipeline: RDS → S3 → Spark → GE → API → DVC",
+    description="Batch preprocessing pipeline: RDS → Validate → S3 → Spark → Validate → S3 → API",
     schedule="*/5 * * * *",                           # Mỗi 5 phút
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     catchup=False,                                    # Không chạy bù các lần bỏ lỡ
@@ -104,22 +112,8 @@ def get_s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
 
 
-def upload_parquet_to_s3(df: pd.DataFrame, s3_key: str) -> str:
-    """Upload DataFrame dưới dạng Parquet lên S3."""
-    import io
-    s3 = get_s3_client()
-    buffer = io.BytesIO()
-    df.to_parquet(buffer, index=False, engine="pyarrow")
-    buffer.seek(0)
-    s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=buffer.getvalue())
-    s3_path = f"s3://{S3_BUCKET}/{s3_key}"
-    logger.info(f"Uploaded {len(df)} rows to {s3_path}")
-    return s3_path
-
-
 def write_dead_letter(df: pd.DataFrame, batch_id: str, step: str, reason: str):
     """Ghi bad data vào dead-letter prefix trên S3."""
-    import io
     key = f"{S3_DEAD_LETTER}/{step}/{batch_id}/dead.parquet"
     reason_key = f"{S3_DEAD_LETTER}/{step}/{batch_id}/reason.txt"
     s3 = get_s3_client()
@@ -129,43 +123,6 @@ def write_dead_letter(df: pd.DataFrame, batch_id: str, step: str, reason: str):
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buffer.getvalue())
     s3.put_object(Bucket=S3_BUCKET, Key=reason_key, Body=reason.encode())
     logger.warning(f"Dead letter written: s3://{S3_BUCKET}/{key}")
-
-
-def clear_s3_prefix(prefix: str):
-    """
-    Xoá toàn bộ object nằm dưới một S3 prefix (xử lý output dạng thư mục
-    của PySpark như _SUCCESS, part-00000.parquet, part-00001.parquet, ...).
-
-    Args:
-        prefix: S3 key prefix không có s3://bucket/, ví dụ:
-                "processed-data/20250101_120000/"
-    """
-    s3 = get_s3_client()
-    # Đảm bảo prefix kết thúc bằng '/' để tránh xoá nhầm key khác
-    if not prefix.endswith("/"):
-        prefix = prefix + "/"
-
-    paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
-
-    keys_to_delete = []
-    for page in pages:
-        for obj in page.get("Contents", []):
-            keys_to_delete.append({"Key": obj["Key"]})
-
-    if not keys_to_delete:
-        logger.info(f"clear_s3_prefix: no objects found under s3://{S3_BUCKET}/{prefix}")
-        return
-
-    # S3 delete_objects hỗ trợ tối đa 1000 key mỗi lần
-    for i in range(0, len(keys_to_delete), 1000):
-        batch = keys_to_delete[i : i + 1000]
-        s3.delete_objects(Bucket=S3_BUCKET, Delete={"Objects": batch})
-
-    logger.info(
-        f"clear_s3_prefix: deleted {len(keys_to_delete)} objects "
-        f"from s3://{S3_BUCKET}/{prefix}"
-    )
 
 
 def extract_failed_indices(result: dict) -> set:
@@ -289,6 +246,8 @@ def extract_from_rds(**context):
     """
     Task 1: Query batch data từ RDS dựa vào last_processed_timestamp.
     Lưu timestamp mới vào Airflow Variable.
+    Push raw DataFrame (JSON) vào XCom để validate_raw đọc trực tiếp —
+    KHÔNG upload lên S3 ngay, việc upload diễn ra sau validate_raw.
     """
     logical_date = context["logical_date"]
     batch_id = get_batch_id(logical_date)
@@ -334,10 +293,10 @@ def extract_from_rds(**context):
     context["ti"].xcom_push(key="row_count", value=len(df))
     context["ti"].xcom_push(key="skip_pipeline", value=False)
 
-    # Lưu raw DataFrame dạng JSON string vào XCom (nếu nhỏ, < 10k rows)
-    # Với batch lớn hơn nên dùng temp file, nhưng 5 phút data thường nhỏ
+    # Push raw DataFrame dạng JSON string vào XCom để validate_raw đọc trực tiếp.
+    # Với batch 5 phút, data thường nhỏ nên XCom là hợp lý.
     context["ti"].xcom_push(
-        key="raw_df_json", 
+        key="raw_df_json",
         value=df.to_json(orient="records", date_format="iso")
     )
 
@@ -345,48 +304,30 @@ def extract_from_rds(**context):
     Variable.set("fraud_pipeline_last_timestamp", batch_end.isoformat())
 
 
-def save_raw_to_s3(**context):
-    """Task 2: Lưu raw data lên S3 /raw-data/{batch_id}/"""
+def validate_raw(**context):
+    """
+    Task 2: Great Expectations validate raw data.
+
+    Đọc raw DataFrame từ XCom (không đọc S3 — vì chưa upload).
+    Sau khi validate:
+      - Tách passed / failed rows.
+      - Push passed_df_json vào XCom cho save_raw_to_s3.
+      - Upload failed rows + reason.txt vào dead-letter trên S3.
+      - Pipeline LUÔN tiếp tục (không raise exception).
+    """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
-        logger.info("Skipping: no data in this batch")
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
     raw_json = ti.xcom_pull(key="raw_df_json", task_ids="extract_from_rds")
+
+    if not raw_json:
+        raise RuntimeError("validate_raw: raw_df_json XCom is empty — extract_from_rds may have failed")
+
     df = pd.read_json(raw_json, orient="records")
-
-    s3_key = f"{S3_RAW}/{batch_id}/raw.parquet"
-    s3_path = upload_parquet_to_s3(df, s3_key)
-    ti.xcom_push(key="raw_s3_path", value=s3_path)
-    logger.info(f"Raw data saved: {s3_path}")
-
-
-def validate_raw(**context):
-    """
-    Task 3: Great Expectations validate raw data.
-
-    Thay vì raise lỗi khi validation fail, task này:
-      1. Chạy GE validation trên toàn bộ DataFrame
-      2. Tách các row bị lỗi (dựa vào partial_unexpected_index_list trong result)
-      3. Upload passed rows trở lại S3 tại cùng đường dẫn raw.parquet
-      4. Upload failed rows + reason.txt vào dead-letter trên S3
-      5. Pipeline LUÔN tiếp tục (không raise exception)
-    """
-    ti = context["ti"]
-    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
-    if skip:
-        return
-
-    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
-
-    s3_key = f"{S3_RAW}/{batch_id}/raw.parquet"
-    s3_path = f"s3://{S3_BUCKET}/{s3_key}"
-    try:
-        df = pd.read_parquet(s3_path)
-    except Exception as e:
-        raise RuntimeError(f"Cannot read raw data from S3: {e}")
+    logger.info(f"validate_raw: loaded {len(df)} rows from XCom")
 
     from ge_validations import validate_raw_data, log_validation_result
     passed, result = validate_raw_data(df)
@@ -413,13 +354,6 @@ def validate_raw(**context):
             write_dead_letter(df, batch_id, "raw_validation", reason)
             passed_df = df  # giữ nguyên tất cả để pipeline tiếp tục
 
-        # ── Overwrite S3 với passed rows ──────────────────────────────────
-        upload_parquet_to_s3(passed_df, s3_key)
-        logger.info(
-            f"validate_raw: {len(passed_df)} passed rows re-uploaded to {s3_path}, "
-            f"{len(failed_df)} failed rows sent to dead-letter."
-        )
-
         send_alert(
             subject=f"Raw Validation PARTIAL FAIL — batch {batch_id}",
             message=(
@@ -431,42 +365,112 @@ def validate_raw(**context):
             level="warning",
             context={"batch_id": batch_id, "failed": result["failed_count"]}
         )
+        logger.info(
+            f"validate_raw: {len(passed_df)} passed rows pushed to XCom, "
+            f"{len(failed_df)} failed rows sent to dead-letter."
+        )
     else:
+        passed_df = df
         logger.info(f"validate_raw: All {len(df)} rows passed validation.")
+
+    # Push passed DataFrame vào XCom để save_raw_to_s3 upload lên S3
+    ti.xcom_push(
+        key="passed_raw_df_json",
+        value=passed_df.to_json(orient="records", date_format="iso")
+    )
+
+
+def save_raw_to_s3(**context):
+    """
+    Task 3: Upload passed raw DataFrame (từ XCom) lên S3 /raw-data/ via PySpark.
+
+    Chỉ upload MỘT LẦN sau khi validation đã tách passed/failed rows.
+    Không cần clear_s3_prefix vì output là single parquet file.
+    """
+    ti = context["ti"]
+    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
+    if skip:
+        logger.info("Skipping: no data in this batch")
+        return
+
+    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    passed_json = ti.xcom_pull(key="passed_raw_df_json", task_ids="validate_raw")
+
+    if not passed_json:
+        raise RuntimeError("save_raw_to_s3: passed_raw_df_json XCom is empty")
+
+    df = pd.read_json(passed_json, orient="records")
+    logger.info(f"save_raw_to_s3: uploading {len(df)} rows to S3")
+
+    from spark_s3_upload import upload_pandas_df_to_s3, get_spark_session
+
+    s3_output_prefix = f"s3a://{S3_BUCKET}/{S3_RAW}/{batch_id}"
+    spark = get_spark_session("FraudDetection-Pipeline")
+    try:
+        s3_path = upload_pandas_df_to_s3(
+            df=df,
+            s3_output_path=s3_output_prefix,
+            filename="raw.parquet",
+            spark=spark,
+        )
+    except Exception as e:
+        spark.stop()
+        raise RuntimeError(f"save_raw_to_s3 failed: {e}") from e
+
+    # Lưu path để run_spark_cleaning dùng làm input
+    ti.xcom_push(key="raw_s3_path", value=s3_path)
+    logger.info(f"Raw data saved: {s3_path}")
 
 
 def run_spark_cleaning(**context):
-    """Task 4: Gọi Spark cleaning & transformation job."""
+    """
+    Task 4: Gọi Spark cleaning & transformation job.
+
+    Đọc raw parquet từ S3 (output của save_raw_to_s3).
+    clean_and_transform trả về Spark DataFrame (không ghi S3).
+    Convert DataFrame → pandas → JSON → push XCom để validate_processed đọc.
+    """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
         return
-    
-    import json
-    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
 
-    input_path  = f"s3a://{S3_BUCKET}/{S3_RAW}/{batch_id}/raw.parquet"
-    output_path = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}"
+    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    raw_s3_path = ti.xcom_pull(key="raw_s3_path", task_ids="save_raw_to_s3")
+
+    if not raw_s3_path:
+        raise RuntimeError("run_spark_cleaning: raw_s3_path XCom is empty")
+
+    # Đảm bảo dùng s3a:// scheme cho Hadoop-AWS
+    input_path = raw_s3_path.replace("s3://", "s3a://")
 
     from spark_cleaning import clean_and_transform, get_spark_session
 
     spark = get_spark_session("FraudDetection-Pipeline")
     try:
-        row_count, fraud_count = clean_and_transform(
+        # clean_and_transform trả về (spark_df, row_count, fraud_count)
+        spark_df, row_count, fraud_count = clean_and_transform(
             input_path=input_path,
-            output_path=output_path,
-            spark=spark,     # truyền session vào để tái sử dụng
+            spark=spark,
         )
+
+        # Convert Spark → pandas để push qua XCom
+        cleaned_pandas_df = spark_df.toPandas()
         result = {
             "batch_id": batch_id,
-            "output_path": output_path,
             "row_count": row_count,
             "fraud_count": fraud_count,
             "status": "success",
         }
         logger.info(f"Spark cleaning result: {result}")
         ti.xcom_push(key="cleaning_result", value=json.dumps(result))
-        # Lưu spark session id để task sau tái sử dụng (thông qua getOrCreate)
+
+        # Push cleaned DataFrame vào XCom để validate_processed đọc
+        ti.xcom_push(
+            key="cleaned_df_json",
+            value=cleaned_pandas_df.to_json(orient="records", date_format="iso")
+        )
+
     except Exception as e:
         logger.error(f"Spark cleaning failed: {e}", exc_info=True)
         spark.stop()
@@ -477,12 +481,12 @@ def validate_processed(**context):
     """
     Task 5: Great Expectations validate processed data.
 
-    Thay vì raise lỗi khi validation fail, task này:
-      1. Chạy GE validation trên toàn bộ DataFrame
-      2. Tách các row bị lỗi (dựa vào partial_unexpected_index_list trong result)
-      3. Upload passed rows trở lại S3 tại cùng thư mục processed
-      4. Upload failed rows + reason.txt vào dead-letter trên S3
-      5. Pipeline LUÔN tiếp tục (không raise exception)
+    Đọc cleaned DataFrame từ XCom (không đọc S3 — chưa upload).
+    Sau khi validate:
+      - Tách passed / failed rows.
+      - Push passed_df_json vào XCom cho save_processed_to_s3.
+      - Upload failed rows + reason.txt vào dead-letter trên S3.
+      - Pipeline LUÔN tiếp tục (không raise exception).
     """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
@@ -490,15 +494,13 @@ def validate_processed(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    cleaned_json = ti.xcom_pull(key="cleaned_df_json", task_ids="run_spark_cleaning")
 
-    # PySpark ghi output dạng thư mục: _SUCCESS + part-*.parquet
-    # → đọc cả thư mục, pandas tự ghép các part file lại
-    s3_prefix = f"{S3_PROCESSED}/{batch_id}/"
-    s3_path = f"s3://{S3_BUCKET}/{s3_prefix}"
-    try:
-        df = pd.read_parquet(s3_path)
-    except Exception as e:
-        raise RuntimeError(f"Cannot read processed data from S3: {e}")
+    if not cleaned_json:
+        raise RuntimeError("validate_processed: cleaned_df_json XCom is empty")
+
+    df = pd.read_json(cleaned_json, orient="records")
+    logger.info(f"validate_processed: loaded {len(df)} rows from XCom")
 
     from ge_validations import validate_processed_data, log_validation_result
     passed, result = validate_processed_data(df)
@@ -523,20 +525,6 @@ def validate_processed(**context):
             write_dead_letter(df, batch_id, "processed_validation", reason)
             passed_df = df
 
-        # ── Xoá toàn bộ Spark part-files cũ rồi upload lại passed rows ───
-        # Cần xoá trước vì Spark tạo nhiều file (part-*.parquet, _SUCCESS, ...)
-        # → upload đè 1 key mới sẽ KHÔNG xoá các file cũ còn lại
-        clear_s3_prefix(s3_prefix)
-        # Dùng tên part-00000.parquet để Spark downstream vẫn đọc được
-        # thư mục như một Parquet dataset bình thường
-        clean_key = f"{s3_prefix}part-00000.parquet"
-        upload_parquet_to_s3(passed_df, clean_key)
-        logger.info(
-            f"validate_processed: {len(passed_df)} passed rows re-uploaded to "
-            f"s3://{S3_BUCKET}/{clean_key}, "
-            f"{len(failed_df)} failed rows sent to dead-letter."
-        )
-
         send_alert(
             subject=f"Processed Validation PARTIAL FAIL — batch {batch_id}",
             message=(
@@ -548,44 +536,116 @@ def validate_processed(**context):
             level="warning",
             context={"batch_id": batch_id}
         )
+        logger.info(
+            f"validate_processed: {len(passed_df)} passed rows pushed to XCom, "
+            f"{len(failed_df)} failed rows sent to dead-letter."
+        )
     else:
+        passed_df = df
         logger.info(f"validate_processed: All {len(df)} rows passed validation.")
+
+    # Push passed DataFrame vào XCom để save_processed_to_s3 upload lên S3
+    ti.xcom_push(
+        key="passed_processed_df_json",
+        value=passed_df.to_json(orient="records", date_format="iso")
+    )
+
+
+def save_processed_to_s3(**context):
+    """
+    Task 6: Upload passed processed DataFrame (từ XCom) lên S3 /processed-data/ via PySpark.
+
+    Chỉ upload MỘT LẦN sau khi validation đã tách passed/failed rows.
+    Không cần clear_s3_prefix vì output là single parquet file.
+    """
+    ti = context["ti"]
+    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
+    if skip:
+        logger.info("Skipping: no data in this batch")
+        return
+
+    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    passed_json = ti.xcom_pull(key="passed_processed_df_json", task_ids="validate_processed")
+
+    if not passed_json:
+        raise RuntimeError("save_processed_to_s3: passed_processed_df_json XCom is empty")
+
+    df = pd.read_json(passed_json, orient="records")
+    logger.info(f"save_processed_to_s3: uploading {len(df)} rows to S3")
+
+    from spark_s3_upload import upload_pandas_df_to_s3, get_spark_session
+
+    s3_output_prefix = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}"
+    spark = get_spark_session("FraudDetection-Pipeline")
+    try:
+        s3_path = upload_pandas_df_to_s3(
+            df=df,
+            s3_output_path=s3_output_prefix,
+            filename="processed.parquet",
+            spark=spark,
+        )
+    except Exception as e:
+        spark.stop()
+        raise RuntimeError(f"save_processed_to_s3 failed: {e}") from e
+
+    # Lưu path để run_spark_features dùng làm input
+    ti.xcom_push(key="processed_s3_path", value=s3_path)
+    logger.info(f"Processed data saved: {s3_path}")
 
 
 def run_spark_features(**context):
-    """Task 6: Gọi Spark feature engineering job."""
+    """
+    Task 7: Gọi Spark feature engineering job.
+
+    Đọc processed parquet từ S3 (output của save_processed_to_s3).
+    feature_engineering trả về Spark DataFrame (không ghi S3).
+    Convert DataFrame → pandas → JSON → push XCom để validate_features đọc.
+    """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
     if skip:
         return
 
-    import json
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
- 
-    input_path  = f"s3a://{S3_BUCKET}/{S3_PROCESSED}/{batch_id}/"
-    output_path = f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}"
- 
+    processed_s3_path = ti.xcom_pull(key="processed_s3_path", task_ids="save_processed_to_s3")
+
+    if not processed_s3_path:
+        raise RuntimeError("run_spark_features: processed_s3_path XCom is empty")
+
+    # Đảm bảo dùng s3a:// scheme cho Hadoop-AWS
+    input_path = processed_s3_path.replace("s3://", "s3a://")
+
     from spark_feature_engineering import feature_engineering, get_spark_session
- 
+
     # getOrCreate sẽ lấy lại session đang chạy nếu còn tồn tại
     spark = get_spark_session("FraudDetection-Pipeline")
     try:
-        row_count, fraud_count = feature_engineering(
+        # feature_engineering trả về (spark_df, row_count, fraud_count)
+        spark_df, row_count, fraud_count = feature_engineering(
             input_path=input_path,
-            output_path=output_path,
             spark=spark,
         )
+
+        # Convert Spark → pandas để push qua XCom
+        feature_pandas_df = spark_df.toPandas()
         result = {
             "batch_id": batch_id,
-            "output_path": output_path,
             "row_count": row_count,
             "fraud_count": fraud_count,
             "status": "success",
         }
         logger.info(f"Spark feature result: {result}")
         ti.xcom_push(key="feature_result", value=json.dumps(result))
-        # Stop session sau khi cả 2 spark tasks hoàn thành
+
+        # Push feature DataFrame vào XCom để validate_features đọc
+        ti.xcom_push(
+            key="feature_df_json",
+            value=feature_pandas_df.to_json(orient="records", date_format="iso")
+        )
+
+        # Stop Spark session sau task features (task cuối dùng Spark)
         spark.stop()
+
     except Exception as e:
         logger.error(f"Spark feature engineering failed: {e}", exc_info=True)
         spark.stop()
@@ -594,14 +654,14 @@ def run_spark_features(**context):
 
 def validate_features(**context):
     """
-    Task 7: Great Expectations validate feature dataset.
+    Task 8: Great Expectations validate feature dataset.
 
-    Thay vì ghi toàn bộ df vào dead-letter khi validation fail, task này:
-      1. Chạy GE validation trên toàn bộ DataFrame
-      2. Tách các row bị lỗi (dựa vào partial_unexpected_index_list trong result)
-      3. Upload passed rows trở lại S3 tại cùng thư mục feature-store
-      4. Upload failed rows + reason.txt vào dead-letter trên S3
-      5. Pipeline LUÔN tiếp tục (không raise exception)
+    Đọc feature DataFrame từ XCom (không đọc S3 — chưa upload).
+    Sau khi validate:
+      - Tách passed / failed rows.
+      - Push passed_df_json vào XCom cho save_features_to_s3.
+      - Upload failed rows + reason.txt vào dead-letter trên S3.
+      - Pipeline LUÔN tiếp tục (không raise exception).
     """
     ti = context["ti"]
     skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
@@ -609,15 +669,13 @@ def validate_features(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    feature_json = ti.xcom_pull(key="feature_df_json", task_ids="run_spark_features")
 
-    # PySpark ghi output dạng thư mục: _SUCCESS + part-*.parquet
-    # → đọc cả thư mục, pandas tự ghép các part file lại
-    s3_prefix = f"{S3_FEATURE}/{batch_id}/"
-    s3_path = f"s3://{S3_BUCKET}/{s3_prefix}"
-    try:
-        df = pd.read_parquet(s3_path)
-    except Exception as e:
-        raise RuntimeError(f"Cannot read feature data from S3: {e}")
+    if not feature_json:
+        raise RuntimeError("validate_features: feature_df_json XCom is empty")
+
+    df = pd.read_json(feature_json, orient="records")
+    logger.info(f"validate_features: loaded {len(df)} rows from XCom")
 
     from ge_validations import validate_feature_store, log_validation_result
     passed, result = validate_feature_store(df)
@@ -642,20 +700,6 @@ def validate_features(**context):
             write_dead_letter(df, batch_id, "feature_validation", reason)
             passed_df = df
 
-        # ── Xoá toàn bộ Spark part-files cũ rồi upload lại passed rows ───
-        # Cần xoá trước vì Spark tạo nhiều file (part-*.parquet, _SUCCESS, ...)
-        # → upload đè 1 key mới sẽ KHÔNG xoá các file cũ còn lại
-        clear_s3_prefix(s3_prefix)
-        # Dùng tên part-00000.parquet để call_fraud_api downstream vẫn đọc được
-        # thư mục như một Parquet dataset bình thường
-        clean_key = f"{s3_prefix}part-00000.parquet"
-        upload_parquet_to_s3(passed_df, clean_key)
-        logger.info(
-            f"validate_features: {len(passed_df)} passed rows re-uploaded to "
-            f"s3://{S3_BUCKET}/{clean_key}, "
-            f"{len(failed_df)} failed rows sent to dead-letter."
-        )
-
         send_alert(
             subject=f"Feature Validation PARTIAL FAIL — batch {batch_id}",
             message=(
@@ -669,16 +713,71 @@ def validate_features(**context):
         )
         logger.warning(
             f"Feature validation failed but pipeline continues — "
-            f"{len(passed_df)} clean rows forwarded to call_fraud_api."
+            f"{len(passed_df)} clean rows forwarded to save_features_to_s3."
+        )
+        logger.info(
+            f"validate_features: {len(passed_df)} passed rows pushed to XCom, "
+            f"{len(failed_df)} failed rows sent to dead-letter."
         )
     else:
+        passed_df = df
         logger.info(f"validate_features: All {len(df)} rows passed validation.")
+
+    # Push passed DataFrame vào XCom để save_features_to_s3 upload lên S3
+    ti.xcom_push(
+        key="passed_features_df_json",
+        value=passed_df.to_json(orient="records", date_format="iso")
+    )
+
+
+def save_features_to_s3(**context):
+    """
+    Task 9: Upload passed features DataFrame (từ XCom) lên S3 /feature-store/ via PySpark.
+
+    Chỉ upload MỘT LẦN sau khi validation đã tách passed/failed rows.
+    Không cần clear_s3_prefix vì output là single parquet file.
+    Push feature_s3_path vào XCom để call_fraud_api đọc.
+    """
+    ti = context["ti"]
+    skip = ti.xcom_pull(key="skip_pipeline", task_ids="extract_from_rds")
+    if skip:
+        logger.info("Skipping: no data in this batch")
+        return
+
+    batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    passed_json = ti.xcom_pull(key="passed_features_df_json", task_ids="validate_features")
+
+    if not passed_json:
+        raise RuntimeError("save_features_to_s3: passed_features_df_json XCom is empty")
+
+    df = pd.read_json(passed_json, orient="records")
+    logger.info(f"save_features_to_s3: uploading {len(df)} rows to S3")
+
+    from spark_s3_upload import upload_pandas_df_to_s3, get_spark_session
+
+    s3_output_prefix = f"s3a://{S3_BUCKET}/{S3_FEATURE}/{batch_id}"
+    spark = get_spark_session("FraudDetection-Pipeline")
+    try:
+        s3_path = upload_pandas_df_to_s3(
+            df=df,
+            s3_output_path=s3_output_prefix,
+            filename="features.parquet",
+            spark=spark,
+        )
+        spark.stop()
+    except Exception as e:
+        spark.stop()
+        raise RuntimeError(f"save_features_to_s3 failed: {e}") from e
+
+    # Lưu path để call_fraud_api dùng làm input
+    ti.xcom_push(key="feature_s3_path", value=s3_path)
+    logger.info(f"Feature data saved: {s3_path}")
 
 
 def call_fraud_api(**context):
     """
-    Task 8: Gọi API Gateway → Lambda → ECS ML Model.
-    - Đọc feature data từ S3
+    Task 10: Gọi API Gateway → Lambda → ECS ML Model.
+    - Đọc feature data từ S3 (output của save_features_to_s3)
     - DROP cột is_fraud_label trước khi gửi (chỉ dùng cho training)
     - Gửi toàn bộ request body tới API trong một cuộc gọi duy nhất
     - Lưu predictions vào XCom
@@ -689,9 +788,13 @@ def call_fraud_api(**context):
         return
 
     batch_id = ti.xcom_pull(key="batch_id", task_ids="extract_from_rds")
+    feature_s3_path = ti.xcom_pull(key="feature_s3_path", task_ids="save_features_to_s3")
 
-    import io
-    s3_path = f"s3://{S3_BUCKET}/{S3_FEATURE}/{batch_id}/"
+    if not feature_s3_path:
+        raise RuntimeError("call_fraud_api: feature_s3_path XCom is empty")
+
+    # Đọc từ S3 — dùng s3:// (boto3/pandas) thay vì s3a://
+    s3_path = feature_s3_path.replace("s3a://", "s3://")
     try:
         df = pd.read_parquet(s3_path)
     except Exception as e:
@@ -753,14 +856,14 @@ with dag:
         python_callable=extract_from_rds,
     )
 
-    t2_save_raw = PythonOperator(
-        task_id="save_raw_to_s3",
-        python_callable=save_raw_to_s3,
-    )
-
-    t3_validate_raw = PythonOperator(
+    t2_validate_raw = PythonOperator(
         task_id="validate_raw",
         python_callable=validate_raw,
+    )
+
+    t3_save_raw = PythonOperator(
+        task_id="save_raw_to_s3",
+        python_callable=save_raw_to_s3,
     )
 
     t4_spark_clean = PythonOperator(
@@ -774,31 +877,47 @@ with dag:
         python_callable=validate_processed,
     )
 
-    t6_spark_features = PythonOperator(
+    t6_save_processed = PythonOperator(
+        task_id="save_processed_to_s3",
+        python_callable=save_processed_to_s3,
+    )
+
+    t7_spark_features = PythonOperator(
         task_id="run_spark_features",
         python_callable=run_spark_features,
         execution_timeout=timedelta(minutes=25),
     )
 
-    t7_validate_features = PythonOperator(
+    t8_validate_features = PythonOperator(
         task_id="validate_features",
         python_callable=validate_features,
     )
 
-    t8_call_api = PythonOperator(
+    t9_save_features = PythonOperator(
+        task_id="save_features_to_s3",
+        python_callable=save_features_to_s3,
+    )
+
+    t10_call_api = PythonOperator(
         task_id="call_fraud_api",
         python_callable=call_fraud_api,
         execution_timeout=timedelta(minutes=10),
     )
 
     # ── Pipeline Flow ─────────────────────────────────────────────────────
+    # extract → validate_raw → save_raw_to_s3
+    # → run_spark_cleaning → validate_processed → save_processed_to_s3
+    # → run_spark_features → validate_features → save_features_to_s3
+    # → call_fraud_api
     (
         t1_extract
-        >> t2_save_raw
-        >> t3_validate_raw
+        >> t2_validate_raw
+        >> t3_save_raw
         >> t4_spark_clean
         >> t5_validate_processed
-        >> t6_spark_features
-        >> t7_validate_features
-        >> t8_call_api
+        >> t6_save_processed
+        >> t7_spark_features
+        >> t8_validate_features
+        >> t9_save_features
+        >> t10_call_api
     )

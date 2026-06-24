@@ -1,5 +1,9 @@
 # Hướng dẫn deploy các tool cho MLOps
 
+## Điều kiện tiên quyết
+
+Phải tạo trước AWS RDS PostgreSQL và lấy `RDS HOST` + `USERNAME` + `PASSWORD`
+
 ## Clone và setup project
 
 ```
@@ -10,14 +14,19 @@ git clone https://github.com/nqvuong23/NT114-MLOps-Project.git nt114-mlops
 cd nt114-mlops
 ```
 
-## Chạy script cấu hình AWS RDS
+## Chạy script deploy các tool cần thiết
+
+Copy và customize giá trị của biến môi trường trong file ``.env để sử dụng (**QUAN TRỌNG**)
 
 ```
-# Copy và customize giá trị của biến môi trường để sử dụng (QUAN TRỌNG)
 cp .env.example .env
 ```
 
-**Thêm giá trị cho biến môi trường trong file `.env.production`**
+```
+# Chạy script setup AWS RDS PostgreSQL
+chmod +x scripts/setup_database.sh
+bash scripts/setup_database.sh
+```
 
 ```
 # Chạy script setup

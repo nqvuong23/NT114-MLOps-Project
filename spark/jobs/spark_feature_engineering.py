@@ -47,14 +47,14 @@ def get_spark_session(app_name: str = "FraudDetection-FeatureEng") -> SparkSessi
 
 def feature_engineering(
     input_path: str,
-    output_path: str,
     spark: SparkSession = None,
-) -> tuple[int, int]:
+) -> tuple:
     """
-    Đọc processed parquet, tính features, ghi feature parquet.
+    Đọc processed parquet, tính features.
+    KHÔNG ghi output lên S3 — trả về DataFrame để DAG validate trước khi upload.
 
     Returns:
-        (row_count, fraud_count)
+        (df, row_count, fraud_count) — Spark DataFrame đã có features
     """
     should_stop = spark is None
     if spark is None:
@@ -118,12 +118,13 @@ def feature_engineering(
 
         row_count = df.count()
         fraud_count = df.filter(F.col("is_fraud_label") == 1).count()
-        logger.info(f"Features: {row_count} rows | fraud: {fraud_count}")
+        logger.info(
+            f"Features: {row_count} rows | fraud: {fraud_count} "
+            f"— DataFrame returned (S3 upload deferred to DAG after validation)"
+        )
 
-        df.coalesce(1).write.mode("overwrite").parquet(output_path)
-        logger.info(f"Written to: {output_path}")
-
-        return row_count, fraud_count
+        # Trả về DataFrame để DAG validate rồi mới upload lên S3
+        return df, row_count, fraud_count
 
     finally:
         if should_stop:
