@@ -56,10 +56,10 @@ logger = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 S3_BUCKET        = os.environ.get("S3_BUCKET_NAME", "")
 S3_PREDICTION    = os.environ.get("S3_PREFIX_PREDICTION", "prediction")
-S3_TRAINING_DATASET        = os.environ.get("S3_PREFIX_TRAINING_DATASET")
+S3_TRAINING_DATASET        = os.environ.get("S3_PREFIX_TRAINING_DATASET", "training-dataset")
 S3_REFERENCE_LOGS = os.environ.get("S3_PREFIX_REFERENCE_LOGS", "reference-logs")  # prefix where training DAG writes snapshots
 S3_CURRENT_REFERENCE = f"{S3_REFERENCE_LOGS}/current_reference.parquet"           # always points to latest promoted model snapshot
-S3_DRIFT_REPORTS = os.environ.get("S3_PREFIX_DRIFT_REPORTS")
+S3_DRIFT_REPORTS = os.environ.get("S3_PREFIX_DRIFT_REPORTS", "drift-reports")
 AWS_REGION       = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
 AIRFLOW_API_BASE = os.environ.get("AIRFLOW_API_URL", "http://airflow-apiserver:8080")
 AIRFLOW_API_USER = os.environ.get("AIRFLOW_API_USER", "admin")
@@ -158,11 +158,15 @@ def load_inference_logs(**context):
     """
     Task 2: Gộp các file /prediction/*.xlsx của 7 ngày gần nhất.
 
-    File prediction có schema:
-      transaction_id, batch_id, predicted_fraud, prediction_timestamp
+    Inference log schema (output của model.predict()):
+      Time, Amount, V1–V28, Predicted_Class
 
-    Cần join với feature data từ feature-store để có input features.
-    → Lấy feature data từ các batch_id tương ứng trong feature-store.
+    Mỗi file xlsx đã chứa đầy đủ input features và kết quả dự đoán —
+    không cần join với bất kỳ feature-store nào.
+
+    Column mapping để align với reference log:
+      Amount        → amount          (casing)
+      Predicted_Class → predicted_fraud (tên cột)
 
     Note: prediction files are Excel (.xlsx); requires openpyxl installed.
     """
@@ -204,50 +208,33 @@ def load_inference_logs(**context):
         context["ti"].xcom_push(key="has_data",      value=False)
         return
 
-    df_predictions = pd.concat(pred_dfs, ignore_index=True)
-    logger.info(f"Total predictions: {len(df_predictions)}")
+    df_current = pd.concat(pred_dfs, ignore_index=True)
+    logger.info(f"Total inference rows loaded: {len(df_current)}")
 
-    # ── Bước 3: Load feature data tương ứng từ feature-store ─────────────
-    # Lấy unique batch_ids từ predictions
-    batch_ids = df_predictions["batch_id"].unique().tolist()
-    logger.info(f"Loading features for {len(batch_ids)} batches...")
+    # ── Bước 3: Rename columns để align với reference log schema ─────────
+    # Inference log dùng 'Amount' (Pascal case) và 'Predicted_Class';
+    # reference log dùng 'amount' và 'is_fraud_label' / 'predicted_fraud'.
+    rename_map = {}
+    if "Amount" in df_current.columns:
+        rename_map["Amount"] = "amount"
+    if "Predicted_Class" in df_current.columns:
+        rename_map["Predicted_Class"] = "predicted_fraud"
+    if rename_map:
+        df_current = df_current.rename(columns=rename_map)
+        logger.info(f"Renamed columns: {rename_map}")
 
-    feature_dfs = []
-    for batch_id in batch_ids:
-        prefix = f"feature-store/{batch_id}/"
-        resp   = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-        for obj in resp.get("Contents", []):
-            if obj["Key"].endswith(".parquet") and "part-" in obj["Key"]:
-                try:
-                    data = s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])
-                    df   = pd.read_parquet(io.BytesIO(data["Body"].read()))
-                    feature_dfs.append(df)
-                except Exception as e:
-                    logger.warning(f"Cannot load feature {obj['Key']}: {e}")
-                break  # Chỉ cần 1 file part per batch
-
-    if not feature_dfs:
-        logger.warning("No feature data found for batches in prediction window")
-        context["ti"].xcom_push(key="current_json",  value=None)
-        context["ti"].xcom_push(key="current_rows",  value=0)
-        context["ti"].xcom_push(key="has_data",      value=False)
-        return
-
-    df_features = pd.concat(feature_dfs, ignore_index=True)
-
-    # ── Bước 4: Join predictions với features ────────────────────────────
-    df_current = df_features.merge(
-        df_predictions[["transaction_id", "predicted_fraud"]],
-        on="transaction_id",
-        how="inner",
-    )
-
-    # Chọn feature columns + predicted_fraud (để check prediction drift)
+    # ── Bước 4: Chọn feature columns + predicted_fraud ────────────────────
+    # FEATURE_COLS dùng chung_feat intersection ở run_drift_detection,
+    # nên chỉ cần giữ các cột có trong FEATURE_COLS + predicted_fraud.
     available_feat = [c for c in FEATURE_COLS if c in df_current.columns]
-    keep_cols      = available_feat + ["is_fraud_label", "predicted_fraud"]
-    df_current_out = df_current[[c for c in keep_cols if c in df_current.columns]]
+    keep_cols      = available_feat + [c for c in ["predicted_fraud"] if c in df_current.columns]
+    df_current_out = df_current[keep_cols].reset_index(drop=True)
 
-    logger.info(f"Current window rows: {len(df_current_out)}")
+    logger.info(
+        f"Current window: {len(df_current_out)} rows | "
+        f"{len(available_feat)} feature cols | "
+        f"predicted_fraud present: {'predicted_fraud' in df_current_out.columns}"
+    )
 
     context["ti"].xcom_push(key="current_json",  value=df_current_out.to_json(orient="records"))
     context["ti"].xcom_push(key="current_rows",  value=len(df_current_out))
@@ -339,14 +326,13 @@ def run_drift_detection(**context):
         pred_result = pred_drift_report.as_dict()
 
         try:
-            pred_drift_p_value  = pred_result["metrics"][0]["result"]["drift_detected"]
-            pred_drift_detected = pred_drift_p_value < PREDICTION_DRIFT_THRESHOLD
-        except (KeyError, TypeError):
-            # Evidently trả về bool drift_detected trực tiếp trong một số versions
-            try:
-                pred_drift_detected = pred_result["metrics"][0]["result"].get("drift_detected", False)
-            except Exception:
-                pass
+            # Evidently trả về 'drift_detected' là bool (True/False), không phải p-value.
+            # Dùng trực tiếp làm boolean; không so sánh với PREDICTION_DRIFT_THRESHOLD float.
+            pred_drift_detected = bool(
+                pred_result["metrics"][0]["result"].get("drift_detected", False)
+            )
+        except (KeyError, TypeError, AttributeError):
+            pred_drift_detected = False
 
         logger.info(
             f"Prediction Drift: detected={pred_drift_detected} | "
