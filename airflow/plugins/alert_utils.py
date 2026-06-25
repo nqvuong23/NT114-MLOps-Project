@@ -75,10 +75,10 @@ def send_email_alert(subject: str, body: str, level: str = "warning"):
         body   : Nội dung email (plain text hoặc HTML)
         level  : 'info' | 'warning' | 'error' | 'success'
     """
-    smtp_host  = os.environ.get("AIRFLOW__SMTP__SMTP_HOST", "smtp.gmail.com")
-    smtp_port  = int(os.environ.get("AIRFLOW__SMTP__SMTP_PORT", 587))
-    smtp_user  = os.environ.get("AIRFLOW__SMTP__SMTP_USER", "")
-    smtp_pass  = os.environ.get("AIRFLOW__SMTP__SMTP_PASSWORD", "")
+    smtp_host  = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port  = int(os.environ.get("SMTP_PORT", 587))
+    smtp_user  = os.environ.get("SMTP_USER", "")
+    smtp_pass  = os.environ.get("SMTP_PASSWORD", "")
     alert_email = os.environ.get("ALERT_EMAIL", smtp_user)
 
     if not smtp_user or not smtp_pass:
@@ -133,7 +133,7 @@ def send_alert(
     context: dict = None,
 ):
     """Gửi alert qua cả Slack và Email cùng lúc."""
-    send_slack_alert(f"*{subject}*\n{message}", level=level, context=context)
+    # send_slack_alert(f"*{subject}*\n{message}", level=level, context=context)
     body = message
     if context:
         body += "\n\nDetails:\n" + "\n".join(f"  {k}: {v}" for k, v in context.items())
